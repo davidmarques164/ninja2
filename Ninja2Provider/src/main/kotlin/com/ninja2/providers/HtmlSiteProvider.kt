@@ -31,7 +31,7 @@ import java.net.URLEncoder
  */
 class HtmlSiteProvider : MainAPI() {
 
-    override var name = "redecanais"
+    override var name = "Rede Canais V7"
     override var mainUrl = "https://redecanais.by"
     override var lang = "pt-br"
     override val hasMainPage = true

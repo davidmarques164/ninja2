@@ -2,7 +2,7 @@
   {
     "url": "https://raw.githubusercontent.com/davidmarques164/ninja2/main/Ninja2Provider.cs3",
     "status": 1,
-    "version": 5,
+    "version": 7,
     "apiVersion": 1,
     "name": "Ninja2Provider",
     "internalName": "Ninja2Provider",
@@ -12,6 +12,6 @@
     "language": "pt-br",
     "tvTypes": ["Movie", "TvSeries", "Live"],
     "iconUrl": null,
-    "fileSize": 36028
+    "fileSize": 36094
   }
 ]
