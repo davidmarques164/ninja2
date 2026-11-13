@@ -25,6 +25,10 @@ import org.jsoup.nodes.Element
 import java.net.URI
 import java.net.URLEncoder
 
+/**
+ * Provedor consolidado para o site ReDECanais / DavidCanais.
+ * Otimizado para isolar lógicas estáticas via Jsoup e ignorar scripts de anúncios/VMs.
+ */
 class HtmlSiteProvider : MainAPI() {
 
     override var name = "redecanais"
@@ -67,8 +71,7 @@ class HtmlSiteProvider : MainAPI() {
         "$base/search.php?keywords=" + URLEncoder.encode(query, "UTF-8")
 
     private object Sel {
-        // Seletores atualizados conforme a estrutura do HTML (carrossel e listagens)
-        const val LIST_ITEM = "ul.pm-ul-carousel-videos li, ul.pm-ul-browse-videos li, div.thumbnail"
+        const val LIST_ITEM = "ul.pm-ul-carousel-videos li, ul.pm-ul-browse-videos li"
         const val ITEM_LINK = "a[href]"
         const val ITEM_TITLE = "h3 a, .caption h3 a, .title"
         const val ITEM_POSTER = "img"
@@ -174,7 +177,7 @@ class HtmlSiteProvider : MainAPI() {
         val link = selectFirst(Sel.ITEM_LINK) ?: return null
         val href = fixUrl(link.attr("href"))
         val title = (selectFirst(Sel.ITEM_TITLE)?.text() ?: link.attr("title")).trim()
-        if (title.isEmpty() || DomainManager.isBlocked(title)) return null
+        if (title.isEmpty() || DomainManager.isBlocked(title) || !href.contains(URI(mainUrl).host ?: "")) return null
 
         val poster = selectFirst(Sel.ITEM_POSTER)?.imageUrl()
         return newMovieSearchResponse(title, href, typeFromUrl(href)) { posterUrl = fixUrlNull(poster) }
