@@ -1,5 +1,6 @@
 package com.ninja2.providers
 
+import android.util.Base64
 import com.lagradost.cloudstream3.ErrorLoadingException
 import com.lagradost.cloudstream3.HomePageResponse
 import com.lagradost.cloudstream3.LoadResponse
@@ -19,33 +20,38 @@ import com.lagradost.cloudstream3.newMovieSearchResponse
 import com.lagradost.cloudstream3.newTvSeriesLoadResponse
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.loadExtractor
-import com.lagradost.cloudstream3.network.CloudflareKiller
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URI
 import java.net.URLEncoder
-import android.util.Base64
 
+/**
+ * Provedor adaptado para o site ReDECanais / DavidCanais.
+ */
 class HtmlSiteProvider : MainAPI() {
 
-    override var name = "redecanais"
+    override var name = "Rede Canais V4"
     override var mainUrl = "https://redecanais.by"
     override var lang = "pt-br"
     override val hasMainPage = true
     override val hasQuickSearch = false
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)
 
+    /** Chave deste provedor no domains.json. */
     private val domainKey = "redecanais"
 
-    // Instância única do CloudflareKiller para preservar o cookie cf_clearance e o User-Agent
-    private val cfKiller by lazy { CloudflareKiller() }
-
-    private val browserHeaders = mapOf(
+    /** Headers de navegador para simular uma requisição real. */
+    private val headers = mapOf(
         "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
-        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-        "Accept-Language" to "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7"
+        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language" to "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
     )
 
+    // region Configuração do site
+
+    /**
+     * Categorias mapeadas com base nas rotas reais do site.
+     */
     override val mainPage = mainPageOf(
         "/browse-filmes-videos-1-date.html" to "Filmes",
         "/browse-series-videos-1-date.html" to "Séries",
@@ -58,19 +64,17 @@ class HtmlSiteProvider : MainAPI() {
         "/browse-amazon-prime-video-videos-1-date.html" to "Amazon Prime Video",
         "/browse-Globoplay-mais-canais-globo-videos-1-date.html" to "Globoplay + Canais Globo",
         "/browse-hbo-max-videos-1-date.html" to "HBO Max",
-        "/browse-paramountplus-videos-1-date.html" to "Paramount+",
-        "/browse-apple-tv-plus-videos-1-date.html" to "AppleTV+",
+        "/browse-paramountplus-videos-1-date.html" to "Paranerd+",
+        "/browse-apple-tv-plus-videos-1-date.html" to "NerdTV+",
         "/browse-discovery-plus-videos-1-date.html" to "Discovery+",
         "/browse-mgmplus-videos-1-date.html" to "Lionsgate+"
     )
 
-    private fun pageUrl(base: String, path: String, page: Int): String {
-        return "$base$path"
-    }
+    private fun pageUrl(base: String, path: String, page: Int): String =
+        "$base$path"
 
-    private fun searchUrl(base: String, query: String): String {
-        return "$base/search.php?keywords=" + URLEncoder.encode(query, "UTF-8")
-    }
+    private fun searchUrl(base: String, query: String): String =
+        "$base/search.php?keywords=" + URLEncoder.encode(query, "UTF-8")
 
     private object Sel {
         const val LIST_ITEM = "ul.pm-ul-carousel-videos li, ul.pm-ul-browse-videos li, div.thumbnail"
@@ -84,9 +88,23 @@ class HtmlSiteProvider : MainAPI() {
         const val PAGE_YEAR = "span.ano, .year"
         const val PAGE_TAGS = ".entry-tags a, a[rel=tag]"
 
+        /** Links que indicam a listagem de episódios (séries/animes). */
         const val EPISODE_LINK = "ul.episodios li a, .episodes a"
+
         const val PLAYER = "iframe, [data-src], [data-url], [data-player]"
     }
+
+    /** Regra de separação de tipo baseada na URL. */
+    private fun typeFromUrl(href: String): TvType = when {
+        "/series/" in href || "/browse-series-" in href || "lista-de-episodios" in href -> TvType.TvSeries
+        "/animes/" in href || "/browse-animes-" in href -> TvType.Anime
+        "/desenhos/" in href || "/browse-desenhos-" in href -> TvType.Anime
+        else -> TvType.Movie
+    }
+
+    // endregion
+
+    // region Domínio e requisições
 
     private suspend fun base(): String {
         mainUrl = DomainManager.current(domainKey, mainUrl)
@@ -94,16 +112,18 @@ class HtmlSiteProvider : MainAPI() {
     }
 
     private suspend fun getDoc(url: String, referer: String? = null): Document {
-        return runCatching { 
-            app.get(url, headers = browserHeaders, interceptor = cfKiller, referer = referer).document 
-        }.getOrElse {
+        return runCatching { app.get(url, headers = headers, referer = referer).document }.getOrElse {
             val oldBase = mainUrl
             DomainManager.invalidate(domainKey)
             val newBase = base()
             if (newBase == oldBase) throw it
-            app.get(url.replaceFirst(oldBase, newBase), headers = browserHeaders, interceptor = cfKiller, referer = referer).document
+            app.get(url.replaceFirst(oldBase, newBase), headers = headers, referer = referer).document
         }
     }
+
+    // endregion
+
+    // region MainAPI
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val doc = getDoc(pageUrl(base(), request.data, page))
@@ -170,6 +190,10 @@ class HtmlSiteProvider : MainAPI() {
         return found
     }
 
+    // endregion
+
+    // region Parsing
+
     private fun Element.toSearchResult(): SearchResponse? {
         val link = selectFirst(Sel.ITEM_LINK) ?: return null
         val href = fixUrl(link.attr("href"))
@@ -177,15 +201,7 @@ class HtmlSiteProvider : MainAPI() {
         if (title.isEmpty() || DomainManager.isBlocked(title)) return null
 
         val poster = selectFirst(Sel.ITEM_POSTER)?.imageUrl()
-
-        val type = when {
-            "/series/" in href || "/browse-series-" in href || "lista-de-episodios" in href -> TvType.TvSeries
-            "/animes/" in href || "/browse-animes-" in href -> TvType.Anime
-            "/desenhos/" in href || "/browse-desenhos-" in href -> TvType.Anime
-            else -> TvType.Movie
-        }
-
-        return newMovieSearchResponse(title, href, type) { posterUrl = fixUrlNull(poster) }
+        return newMovieSearchResponse(title, href, typeFromUrl(href)) { posterUrl = fixUrlNull(poster) }
     }
 
     private fun Element.imageUrl(): String? =
@@ -205,18 +221,22 @@ class HtmlSiteProvider : MainAPI() {
         return EP_REGEX.find(text)?.groupValues?.get(1)?.toIntOrNull()?.let { 1 to it }
     }
 
+    // endregion
+
+    // region Redirecionamentos
+
     private suspend fun resolveRedirects(url: String, referer: String, depth: Int = 0): String {
         if (depth >= MAX_REDIRECT_DEPTH || !url.isSameSite()) return url
 
-        // Passa o interceptor do CloudflareKiller e os headers também nas requisições de redirecionamento/player
-        val res = app.get(url, headers = browserHeaders, interceptor = cfKiller, referer = referer)
+        val res = app.get(url, headers = headers, referer = referer)
         if (!res.url.isSameSite()) return res.url
 
         val html = res.text
         val doc = res.document
-        
+
         val metaRefresh = doc.selectFirst("meta[http-equiv=refresh]")?.attr("content")
             ?.substringAfter("url=", "")?.replace(QUOTES_REGEX, "")?.trim()
+            ?.takeIf { it.isNotEmpty() }
 
         val next = doc.selectFirst("iframe")?.playerUrl()
             ?: metaRefresh
@@ -235,14 +255,18 @@ class HtmlSiteProvider : MainAPI() {
         runCatching { String(Base64.decode(this, Base64.DEFAULT)) }.getOrNull()
             ?.takeIf { it.startsWith("http") || it.startsWith("/") }
 
+    // endregion
+
     private companion object {
         const val MAX_REDIRECT_DEPTH = 4
         val YEAR_REGEX = Regex("\\b(19|20)\\d{2}\\b")
         val SE_REGEX = Regex("(\\d+)\\s*[xXeE]\\s*(\\d+)")
         val EP_REGEX = Regex("(?i)ep(?:is[oó]dio)?\\.?\\s*(\\d+)")
-        val QUOTES_REGEX = Regex("[\"\']")
+
+        val QUOTES_REGEX = Regex("[\\x22\\x27]")
         val JS_LOCATION_REGEX =
             Regex("(?:window\\.|document\\.)?location(?:\\.href)?\\s*=\\s*\\x22([^\\x22]+)\\x22|\\x27([^\\x27]+)\\x27")
-        val BASE64_REGEX = Regex("atob\\(\\s*\\x22([A-Za-z0-9+/=]{16,})\\x22|\\x27([A-Za-z0-9+/=]{16,})\\x27\\s*\\)")
+        val BASE64_REGEX =
+            Regex("atob\\(\\s*\\x22([A-Za-z0-9+/=]{16,})\\x22|\\x27([A-Za-z0-9+/=]{16,})\\x27\\s*\\)")
     }
 }
