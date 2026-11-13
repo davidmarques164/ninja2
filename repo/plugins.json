@@ -1,0 +1,17 @@
+[
+  {
+    "url": "https://raw.githubusercontent.com/davidmarques164/ninja2/main/Ninja2Provider.cs3",
+    "status": 1,
+    "version": 1,
+    "apiVersion": 1,
+    "name": "Ninja2Provider",
+    "internalName": "Ninja2Provider",
+    "authors": ["ResearchCaseStudy"],
+    "description": "Ninja 2 - provedores PT-BR baseados em páginas HTML/PHP",
+    "repositoryUrl": "https://github.com/davidmarques164/ninja2",
+    "language": "pt-br",
+    "tvTypes": ["Movie", "TvSeries", "Live"],
+    "iconUrl": null,
+    "fileSize": 0
+  }
+]
