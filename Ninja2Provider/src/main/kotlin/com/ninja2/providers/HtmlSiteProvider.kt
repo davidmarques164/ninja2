@@ -19,6 +19,7 @@ import com.lagradost.cloudstream3.newMovieSearchResponse
 import com.lagradost.cloudstream3.newTvSeriesLoadResponse
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.loadExtractor
+import com.lagradost.cloudstream3.network.CloudflareKiller
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URI
@@ -36,8 +37,10 @@ class HtmlSiteProvider : MainAPI() {
 
     private val domainKey = "redecanais"
 
-    // Headers para simular um navegador real e evitar bloqueios simples
-    private val headers = mapOf(
+    // Instância única do CloudflareKiller para preservar o cookie cf_clearance e o User-Agent
+    private val cfKiller by lazy { CloudflareKiller() }
+
+    private val browserHeaders = mapOf(
         "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
         "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
         "Accept-Language" to "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7"
@@ -91,12 +94,14 @@ class HtmlSiteProvider : MainAPI() {
     }
 
     private suspend fun getDoc(url: String, referer: String? = null): Document {
-        return runCatching { app.get(url, headers = headers, referer = referer).document }.getOrElse {
+        return runCatching { 
+            app.get(url, headers = browserHeaders, interceptor = cfKiller, referer = referer).document 
+        }.getOrElse {
             val oldBase = mainUrl
             DomainManager.invalidate(domainKey)
             val newBase = base()
             if (newBase == oldBase) throw it
-            app.get(url.replaceFirst(oldBase, newBase), headers = headers, referer = referer).document
+            app.get(url.replaceFirst(oldBase, newBase), headers = browserHeaders, interceptor = cfKiller, referer = referer).document
         }
     }
 
@@ -203,7 +208,8 @@ class HtmlSiteProvider : MainAPI() {
     private suspend fun resolveRedirects(url: String, referer: String, depth: Int = 0): String {
         if (depth >= MAX_REDIRECT_DEPTH || !url.isSameSite()) return url
 
-        val res = app.get(url, headers = headers, referer = referer)
+        // Passa o interceptor do CloudflareKiller e os headers também nas requisições de redirecionamento/player
+        val res = app.get(url, headers = browserHeaders, interceptor = cfKiller, referer = referer)
         if (!res.url.isSameSite()) return res.url
 
         val html = res.text
