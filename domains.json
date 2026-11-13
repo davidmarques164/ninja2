@@ -1,0 +1,10 @@
+{
+  "htmlsite": [
+    "https://exemplo.com",
+    "https://exemplo-backup.com"
+  ],
+  "livesite": [
+    "https://exemplo.com"
+  ],
+  "blocked": []
+}

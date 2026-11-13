@@ -1,0 +1,6 @@
+{
+  "name": "Ninja2",
+  "description": "Ninja 2 - provedores PT-BR baseados em páginas HTML/PHP",
+  "manifestVersion": 1,
+  "pluginLists": ["https://raw.githubusercontent.com/davidmarques164/ninja2/main/plugins.json"]
+}
