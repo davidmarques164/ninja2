@@ -36,6 +36,13 @@ class HtmlSiteProvider : MainAPI() {
 
     private val domainKey = "redecanais"
 
+    // Headers para simular um navegador real e evitar bloqueios simples
+    private val headers = mapOf(
+        "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language" to "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7"
+    )
+
     override val mainPage = mainPageOf(
         "/browse-filmes-videos-1-date.html" to "Filmes",
         "/browse-series-videos-1-date.html" to "Séries",
@@ -84,12 +91,12 @@ class HtmlSiteProvider : MainAPI() {
     }
 
     private suspend fun getDoc(url: String, referer: String? = null): Document {
-        return runCatching { app.get(url, referer = referer).document }.getOrElse {
+        return runCatching { app.get(url, headers = headers, referer = referer).document }.getOrElse {
             val oldBase = mainUrl
             DomainManager.invalidate(domainKey)
             val newBase = base()
             if (newBase == oldBase) throw it
-            app.get(url.replaceFirst(oldBase, newBase), referer = referer).document
+            app.get(url.replaceFirst(oldBase, newBase), headers = headers, referer = referer).document
         }
     }
 
@@ -196,7 +203,7 @@ class HtmlSiteProvider : MainAPI() {
     private suspend fun resolveRedirects(url: String, referer: String, depth: Int = 0): String {
         if (depth >= MAX_REDIRECT_DEPTH || !url.isSameSite()) return url
 
-        val res = app.get(url, referer = referer)
+        val res = app.get(url, headers = headers, referer = referer)
         if (!res.url.isSameSite()) return res.url
 
         val html = res.text
@@ -207,8 +214,8 @@ class HtmlSiteProvider : MainAPI() {
 
         val next = doc.selectFirst("iframe")?.playerUrl()
             ?: metaRefresh
-            ?: JS_LOCATION_REGEX.find(html)?.groupValues?.get(1)
-            ?: BASE64_REGEX.find(html)?.groupValues?.get(1)?.decodeBase64()
+            ?: JS_LOCATION_REGEX.find(html)?.groupValues?.let { it[1].ifEmpty { it[2] } }
+            ?: BASE64_REGEX.find(html)?.groupValues?.let { it[1].ifEmpty { it[2] } }?.decodeBase64()
             ?: return url
 
         if (next.isBlank()) return url
