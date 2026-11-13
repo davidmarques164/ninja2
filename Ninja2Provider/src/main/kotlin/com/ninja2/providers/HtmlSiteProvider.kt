@@ -25,33 +25,23 @@ import org.jsoup.nodes.Element
 import java.net.URI
 import java.net.URLEncoder
 
-/**
- * Provedor adaptado para o site ReDECanais / DavidCanais.
- */
 class HtmlSiteProvider : MainAPI() {
 
-    override var name = "Rede Canais V4"
+    override var name = "redecanais"
     override var mainUrl = "https://redecanais.by"
     override var lang = "pt-br"
     override val hasMainPage = true
     override val hasQuickSearch = false
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)
 
-    /** Chave deste provedor no domains.json. */
     private val domainKey = "redecanais"
 
-    /** Headers de navegador para simular uma requisição real. */
     private val headers = mapOf(
         "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
         "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language" to "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
     )
 
-    // region Configuração do site
-
-    /**
-     * Categorias mapeadas com base nas rotas reais do site.
-     */
     override val mainPage = mainPageOf(
         "/browse-filmes-videos-1-date.html" to "Filmes",
         "/browse-series-videos-1-date.html" to "Séries",
@@ -59,13 +49,13 @@ class HtmlSiteProvider : MainAPI() {
         "/browse-desenhos-videos-1-date.html" to "Desenhos",
         "/browse-novelas-videos-1-date.html" to "Novelas",
         "/browse-doramas-videos-1-date.html" to "Doramas",
-        "/browse-Netflix-videos-1-date.html" to "Netflix",
+        "/browse-netflix-videos-1-date.html" to "Netflix",
         "/browse-disneyplus-videos-1-date.html" to "Disney+",
         "/browse-amazon-prime-video-videos-1-date.html" to "Amazon Prime Video",
-        "/browse-Globoplay-mais-canais-globo-videos-1-date.html" to "Globoplay + Canais Globo",
+        "/browse-globoplay-mais-canais-globo-videos-1-date.html" to "Globoplay + Canais Globo",
         "/browse-hbo-max-videos-1-date.html" to "HBO Max",
-        "/browse-paramountplus-videos-1-date.html" to "Paranerd+",
-        "/browse-apple-tv-plus-videos-1-date.html" to "NerdTV+",
+        "/browse-paramountplus-videos-1-date.html" to "Paramount+",
+        "/browse-apple-tv-plus-videos-1-date.html" to "Apple TV+",
         "/browse-discovery-plus-videos-1-date.html" to "Discovery+",
         "/browse-mgmplus-videos-1-date.html" to "Lionsgate+"
     )
@@ -77,6 +67,7 @@ class HtmlSiteProvider : MainAPI() {
         "$base/search.php?keywords=" + URLEncoder.encode(query, "UTF-8")
 
     private object Sel {
+        // Seletores atualizados conforme a estrutura do HTML (carrossel e listagens)
         const val LIST_ITEM = "ul.pm-ul-carousel-videos li, ul.pm-ul-browse-videos li, div.thumbnail"
         const val ITEM_LINK = "a[href]"
         const val ITEM_TITLE = "h3 a, .caption h3 a, .title"
@@ -88,23 +79,16 @@ class HtmlSiteProvider : MainAPI() {
         const val PAGE_YEAR = "span.ano, .year"
         const val PAGE_TAGS = ".entry-tags a, a[rel=tag]"
 
-        /** Links que indicam a listagem de episódios (séries/animes). */
         const val EPISODE_LINK = "ul.episodios li a, .episodes a"
-
-        const val PLAYER = "iframe, [data-src], [data-url], [data-player]"
+        const val PLAYER = "iframe, [data-src], [data-url], [data-player], embed, object"
     }
 
-    /** Regra de separação de tipo baseada na URL. */
     private fun typeFromUrl(href: String): TvType = when {
         "/series/" in href || "/browse-series-" in href || "lista-de-episodios" in href -> TvType.TvSeries
         "/animes/" in href || "/browse-animes-" in href -> TvType.Anime
         "/desenhos/" in href || "/browse-desenhos-" in href -> TvType.Anime
         else -> TvType.Movie
     }
-
-    // endregion
-
-    // region Domínio e requisições
 
     private suspend fun base(): String {
         mainUrl = DomainManager.current(domainKey, mainUrl)
@@ -120,10 +104,6 @@ class HtmlSiteProvider : MainAPI() {
             app.get(url.replaceFirst(oldBase, newBase), headers = headers, referer = referer).document
         }
     }
-
-    // endregion
-
-    // region MainAPI
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val doc = getDoc(pageUrl(base(), request.data, page))
@@ -190,10 +170,6 @@ class HtmlSiteProvider : MainAPI() {
         return found
     }
 
-    // endregion
-
-    // region Parsing
-
     private fun Element.toSearchResult(): SearchResponse? {
         val link = selectFirst(Sel.ITEM_LINK) ?: return null
         val href = fixUrl(link.attr("href"))
@@ -220,10 +196,6 @@ class HtmlSiteProvider : MainAPI() {
         }
         return EP_REGEX.find(text)?.groupValues?.get(1)?.toIntOrNull()?.let { 1 to it }
     }
-
-    // endregion
-
-    // region Redirecionamentos
 
     private suspend fun resolveRedirects(url: String, referer: String, depth: Int = 0): String {
         if (depth >= MAX_REDIRECT_DEPTH || !url.isSameSite()) return url
@@ -254,8 +226,6 @@ class HtmlSiteProvider : MainAPI() {
     private fun String.decodeBase64(): String? =
         runCatching { String(Base64.decode(this, Base64.DEFAULT)) }.getOrNull()
             ?.takeIf { it.startsWith("http") || it.startsWith("/") }
-
-    // endregion
 
     private companion object {
         const val MAX_REDIRECT_DEPTH = 4
