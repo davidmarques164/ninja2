@@ -39,6 +39,7 @@ import kotlin.coroutines.cancellation.CancellationException
 import okhttp3.Dns
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.UnknownHostException
 import java.util.concurrent.TimeUnit
@@ -48,7 +49,7 @@ import java.util.concurrent.TimeUnit
  */
 class HtmlSiteProvider : MainAPI() {
 
-    override var name = "Rede Canais V16"
+    override var name = "Rede Canais V17"
     override var mainUrl = "https://redecanais.by"
     override var lang = "pt-br"
     override val hasMainPage = true
@@ -517,22 +518,10 @@ class HtmlSiteProvider : MainAPI() {
     /**
      * Variantes do mesmo link assinado:
      *  proxy     -> URL original
-     *  proxy-alt -> mesmo caminho, subdomínio simples (a Cloudflare roteia pelo domínio)
-     *  proxy-raiz-> domínio sem subdomínio
      *  direto    -> URL de origem que está dentro do parâmetro url= (neosoro.gq)
      */
     private fun rcVariants(videoUrl: String): List<Pair<String, String>> {
         val out = mutableListOf("proxy" to videoUrl)
-        runCatching {
-            val u = URI(videoUrl)
-            val host = u.host ?: u.authority
-            val root = PROXY_ROOT_REGEX.find(host)?.value
-            if (root != null && host != root) {
-                val rest = videoUrl.substringAfter(host)
-                out += "proxy-alt" to "https://v.$root$rest"
-                out += "proxy-raiz" to "https://$root$rest"
-            }
-        }
         INNER_URL_REGEX.find(videoUrl)?.groupValues?.get(1)?.let { inner ->
             val decoded = if (inner.startsWith("http")) inner else URLDecoder.decode(inner, "UTF-8")
             if (decoded.startsWith("http")) out += "direto" to decoded
@@ -849,8 +838,6 @@ class HtmlSiteProvider : MainAPI() {
          * player e "avisa" navegando um iframe para um host sentinela, que o interceptador vê.
          * Se em ~50 s não achar, avisa com ?err=<estado> para diagnóstico.
          */
-        /** Domínio registrável do proxy (ex.: null-null.shop) dentro de um host qualquer. */
-        val PROXY_ROOT_REGEX = Regex("""[A-Za-z0-9-]+\.[A-Za-z]{2,}$""")
         /** URL de origem dentro do proxy: ...proxy?...&url=<https://neosoro.gq/...> (vai até o fim). */
         val INNER_URL_REGEX = Regex("""[?&]url=(https?(?::|%3A).+)$""")
         const val RC_CAPTURE_HOST = "rc-capture.invalid"
@@ -978,15 +965,40 @@ object RcDns : Dns {
         Log.d(TAG, "[dns] RcDns instalado (anterior: ${fallback.javaClass.simpleName})")
     }
 
+    /** Hosts do vídeo: o link é assinado para o IPv4 do cliente (ip=...&ipv6=), então só IPv4. */
+    private val IPV4_ONLY = Regex("""(^|\.)(null-null\.shop|neosoro\.[a-z]+)$""", RegexOption.IGNORE_CASE)
+
     override fun lookup(hostname: String): List<InetAddress> {
         cache[hostname]?.let { (until, ips) -> if (System.currentTimeMillis() < until) return ips }
+        val v4only = IPV4_ONLY.containsMatchIn(hostname)
 
-        val firstError = try {
-            return fallback.lookup(hostname).also { lastResult[hostname] = "sistema" }
+        var firstError: UnknownHostException? = null
+        val sys = try {
+            fallback.lookup(hostname)
         } catch (e: UnknownHostException) {
-            e
+            firstError = e; null
         }
 
+        val sysV4 = sys?.filterIsInstance<Inet4Address>().orEmpty()
+        if (sysV4.isNotEmpty()) {
+            lastResult[hostname] = "sistema v4"
+            // IPv4 primeiro sempre; IPv6 só como último recurso e nunca nos hosts do vídeo
+            return if (v4only) sysV4 else sysV4 + (sys.orEmpty() - sysV4.toSet())
+        }
+
+        // Sistema falhou ou só devolveu IPv6: pede registro A via DNS sobre HTTPS
+        val doh = dohLookupV4(hostname)
+        if (doh.isNotEmpty()) return doh
+
+        if (!sys.isNullOrEmpty() && !v4only) {
+            lastResult[hostname] = "sistema só v6"
+            return sys
+        }
+        lastResult[hostname] = if (sys.isNullOrEmpty()) "falhou" else "só v6 (descartado)"
+        throw firstError ?: UnknownHostException("$hostname: sem endereço IPv4")
+    }
+
+    private fun dohLookupV4(hostname: String): List<InetAddress> {
         for (endpoint in ENDPOINTS) {
             val ips = try {
                 val req = Request.Builder()
@@ -1004,14 +1016,13 @@ object RcDns : Dns {
             }
             if (ips.isNotEmpty()) {
                 val via = endpoint.substringAfter("//").substringBefore('/')
-                lastResult[hostname] = "doh $via"
+                lastResult[hostname] = "doh v4 $via"
                 Log.d(TAG, "[dns] $hostname -> ${ips.map { it.hostAddress }} via $via")
                 cache[hostname] = (System.currentTimeMillis() + 5 * 60_000L) to ips
                 return ips
             }
         }
-        lastResult[hostname] = "falhou"
-        throw firstError
+        return emptyList()
     }
 
     /** Resumo para o [DEBUG]: como cada host foi resolvido. */
