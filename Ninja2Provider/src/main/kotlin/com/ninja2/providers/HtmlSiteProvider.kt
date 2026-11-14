@@ -11,6 +11,13 @@ import com.lagradost.cloudstream3.MainPageRequest
 import com.lagradost.cloudstream3.SearchResponse
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.TvType
+import com.lagradost.cloudstream3.Actor
+import com.lagradost.cloudstream3.ActorData
+import com.lagradost.cloudstream3.Score
+import com.lagradost.cloudstream3.LoadResponse.Companion.addImdbId
+import com.lagradost.cloudstream3.LoadResponse.Companion.addTMDbId
+import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
+import com.lagradost.cloudstream3.addDate
 import com.lagradost.cloudstream3.amap
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.fixUrl
@@ -45,6 +52,8 @@ import java.net.Inet4Address
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.util.UUID
+import org.json.JSONArray
+import org.json.JSONObject
 import java.net.Socket
 import java.net.SocketAddress
 import java.security.KeyStore
@@ -65,7 +74,7 @@ import java.util.concurrent.TimeUnit
  */
 class HtmlSiteProvider : MainAPI() {
 
-    override var name = "Rede Canais V21"
+    override var name = "Rede Canais V23"
     override var mainUrl = "https://redecanais.by"
     override var lang = "pt-br"
     override val hasMainPage = true
@@ -310,7 +319,33 @@ class HtmlSiteProvider : MainAPI() {
 
         log("load", "episódios=${episodes.size}")
 
-        return if (episodes.isNotEmpty()) {
+        // ---- TMDB: poster, fundo, sinopse, nota, duração, gêneros, elenco, trailer e dados por episódio
+        val isSeries = episodes.isNotEmpty()
+        val seasons = episodes.mapNotNull { it.season }.distinct()
+        val meta = safe("tmdb") { Tmdb.lookup(title, year, isSeries, seasons, TMDB_TIMEOUT_MS) }
+        log("load", "tmdb=" + (meta?.let { "${it.id} ${it.title} (${it.year}) eps=${it.episodes.size}" } ?: "sem resultado"))
+
+        // Sinopse do site em série costuma ser a própria lista de episódios: descarta nesse caso.
+        val sitePlot = plot?.takeUnless { isSeries && LIST_PLOT_REGEX.containsMatchIn(it) }
+        val finalPlot = meta?.overview?.takeIf { it.isNotBlank() } ?: sitePlot
+        val finalPoster = meta?.poster ?: fixUrlNull(poster)
+        val finalTags = meta?.genres?.takeIf { it.isNotEmpty() } ?: tags
+        val finalYear = meta?.year ?: year
+
+        if (meta != null && isSeries) {
+            for (ep in episodes) {
+                val e = meta.episodes[(ep.season ?: 1) to (ep.episode ?: continue)] ?: continue
+                e.still?.let { ep.posterUrl = it }
+                e.overview?.takeIf { it.isNotBlank() }?.let { ep.description = it }
+                e.runtime?.let { ep.runTime = it }
+                e.airDate?.let { ep.addDate(it) }
+                if (ep.name.isNullOrBlank() || GENERIC_EP_NAME_REGEX.matches(ep.name ?: "")) {
+                    e.name?.takeIf { it.isNotBlank() }?.let { ep.name = it }
+                }
+            }
+        }
+
+        return if (isSeries) {
             val crumbs = (doc.select(Sel.BREADCRUMB).map { it.text() } + tags).joinToString(" ").lowercase()
             val type = when {
                 "dorama" in crumbs -> TvType.AsianDrama
@@ -319,13 +354,27 @@ class HtmlSiteProvider : MainAPI() {
                 else -> typeFromUrl(pageUrl, TvType.TvSeries)
             }
             newTvSeriesLoadResponse(title, pageUrl, type, episodes) {
-                posterUrl = fixUrlNull(poster); this.plot = plot; this.year = year; this.tags = tags
+                posterUrl = finalPoster; this.plot = finalPlot; this.year = finalYear; this.tags = finalTags
+                applyTmdb(meta)
             }
         } else {
             newMovieLoadResponse(title, pageUrl, TvType.Movie, pageUrl) {
-                posterUrl = fixUrlNull(poster); this.plot = plot; this.year = year; this.tags = tags
+                posterUrl = finalPoster; this.plot = finalPlot; this.year = finalYear; this.tags = finalTags
+                applyTmdb(meta)
             }
         }
+    }
+
+    /** Campos comuns a filme e série vindos do TMDB. */
+    private suspend fun LoadResponse.applyTmdb(meta: TmdbMeta?) {
+        if (meta == null) return
+        backgroundPosterUrl = meta.backdrop ?: backgroundPosterUrl
+        meta.runtime?.let { duration = it }
+        meta.vote?.takeIf { it > 0 }?.let { score = Score.from10(it) }
+        actors = meta.cast.map { (name, character, photo) -> ActorData(Actor(name, photo), roleString = character) }
+        addTMDbId(meta.id.toString())
+        addImdbId(meta.imdbId)
+        meta.trailers.forEach { addTrailer(it) }
     }
 
     /** Primeiro candidato não genérico; se todos forem genéricos, o primeiro não nulo. */
@@ -892,6 +941,11 @@ class HtmlSiteProvider : MainAPI() {
         /** "Temporada 2" ou "2ª Temporada" */
         val SEASON_REGEX = Regex("""(?i)(?:temporada\s*(\d+)|(\d+)\s*[ªºa°]?\s*temporada)""")
 
+        /** Texto que é lista de episódios, não sinopse. */
+        val LIST_PLOT_REGEX = Regex("""(?i)assistir|(?:epis[oó]dio\s*\d+[\s\S]*){2}""")
+        val GENERIC_EP_NAME_REGEX = Regex("""(?i)^\s*epis[oó]dio\s*\d+\s*$""")
+        /** Prazo do TMDB; passou disso a página abre só com os dados do site (ou o que já chegou). */
+        const val TMDB_TIMEOUT_MS = 8_000L
         val LIST_SUFFIX_REGEX = Regex("""(?i)\s*[-–]\s*lista\s+de\s+epis[oó]dios\s*$""")
         val EP_SUFFIX_REGEX = Regex("""(?i)\s*[-–|]?\s*\(?\b(?:dublado|legendado|dub|leg)\b\)?\s*$""")
 
@@ -1360,4 +1414,222 @@ object RcLocalProxy {
             Log.d(TAG, "[local] conexão encerrada: ${e.javaClass.simpleName}")
         }
     }
+}
+
+// =====================================================================================
+// TMDB
+// =====================================================================================
+
+/**
+ * COLE AQUI SUA CHAVE DO TMDB (grátis): themoviedb.org > Configurações > API.
+ * Serve a "Chave da API (v3)" ou o "Token de leitura da API (v4)". Vazio = sem TMDB.
+ */
+const val TMDB_API_KEY = "490e3556418b90551b88c10d31e536fe"
+
+data class TmdbEpisode(
+    val name: String?,
+    val overview: String?,
+    val still: String?,
+    val airDate: String?,
+    val runtime: Int?,
+)
+
+data class TmdbMeta(
+    val id: Int,
+    val title: String,
+    val overview: String?,
+    val poster: String?,
+    val backdrop: String?,
+    val year: Int?,
+    val runtime: Int?,
+    val vote: Double?,
+    val genres: List<String>,
+    /** nome, personagem, foto */
+    val cast: List<Triple<String, String?, String?>>,
+    val trailers: List<String>,
+    val imdbId: String?,
+    val episodes: Map<Pair<Int, Int>, TmdbEpisode>,
+)
+
+object Tmdb {
+    private const val TAG = "RedeCanais"
+    private const val API = "https://api.themoviedb.org/3"
+    private const val IMG = "https://image.tmdb.org/t/p/"
+    private const val LANG = "pt-BR"
+
+    private val cache = ConcurrentHashMap<String, TmdbMeta>()
+
+    /** Partes do título do site que atrapalham a busca: (Dublado), ano, qualidade etc. */
+    private val NOISE_PARENS = Regex("""(?i)\((?:dublado|legendado|nacional|dual[^)]*|dub|leg|4k|hd)\)""")
+    private val NOISE_PART = Regex("""(?i)^(?:\d{4}|\d{3,4}p|4k|hd|dublado|legendado|nacional|lista de epis[oó]dios|\d+[ªºa]?\s*temporada.*)$""")
+
+    fun cleanTitle(siteTitle: String): String =
+        siteTitle.replace(NOISE_PARENS, " ")
+            .split(Regex("""\s+[-–|]\s+"""))
+            .map { it.trim() }
+            .filter { it.isNotEmpty() && !NOISE_PART.matches(it) }
+            .joinToString(" - ")
+            .replace(Regex("""\s+"""), " ")
+            .trim()
+
+    fun normalize(s: String): String =
+        java.text.Normalizer.normalize(s.lowercase(), java.text.Normalizer.Form.NFD)
+            .replace(Regex("""\p{M}+"""), "")
+            .replace(Regex("""[^a-z0-9]"""), "")
+
+    private fun img(path: String?, size: String): String? =
+        path?.takeIf { it.startsWith("/") }?.let { IMG + size + it }
+
+    /**
+     * Prazo da consulta (sem kotlinx.coroutines): passado o prazo, as próximas requisições
+     * nem saem, e cada uma tem timeout limitado ao tempo que resta (máx. 6 s).
+     */
+    private suspend fun get(
+        path: String,
+        params: Map<String, String> = emptyMap(),
+        until: Long = Long.MAX_VALUE,
+    ): JSONObject? {
+        val key = TMDB_API_KEY.trim()
+        if (key.isEmpty()) return null
+        val remainingMs = until - System.currentTimeMillis()
+        if (remainingMs <= 300) {
+            Log.w(TAG, "[tmdb] prazo esgotado, pulando $path")
+            return null
+        }
+        val timeoutSec = (remainingMs / 1000).coerceIn(1L, 6L)
+        val bearer = key.length > 40   // token v4 é um JWT longo; chave v3 tem 32 caracteres
+        val all = params + ("language" to LANG) + (if (bearer) emptyMap() else mapOf("api_key" to key))
+        val url = API + path + "?" + all.entries.joinToString("&") {
+            it.key + "=" + java.net.URLEncoder.encode(it.value, "UTF-8")
+        }
+        val headers = mutableMapOf("Accept" to "application/json")
+        if (bearer) headers["Authorization"] = "Bearer $key"
+        val res = app.get(url, headers = headers, timeout = timeoutSec)
+        if (!res.isSuccessful) {
+            Log.w(TAG, "[tmdb] HTTP ${res.code} em $path")
+            return null
+        }
+        return JSONObject(res.text)
+    }
+
+    suspend fun lookup(
+        siteTitle: String,
+        siteYear: Int?,
+        isSeries: Boolean,
+        seasons: List<Int>,
+        timeoutMs: Long = 8_000L,
+    ): TmdbMeta? {
+        if (TMDB_API_KEY.isBlank()) return null
+        val until = System.currentTimeMillis() + timeoutMs
+        val query = cleanTitle(siteTitle).ifEmpty { return null }
+        val cacheKey = "${if (isSeries) "tv" else "movie"}|${normalize(query)}|$siteYear"
+        cache[cacheKey]?.let { return it }
+
+        val id = search(query, siteYear, isSeries, until) ?: return null
+        val meta = if (isSeries) loadTv(id, seasons, until) else loadMovie(id, until)
+        meta?.let { cache[cacheKey] = it }
+        return meta
+    }
+
+    /** Busca e escolhe o resultado mais parecido (nome igual pesa mais; ano confirma). */
+    private suspend fun search(query: String, year: Int?, isSeries: Boolean, until: Long): Int? {
+        val path = if (isSeries) "/search/tv" else "/search/movie"
+        val yearParam = if (isSeries) "first_air_date_year" else "primary_release_year"
+        var results = year?.let { get(path, mapOf("query" to query, yearParam to it.toString()), until)?.optJSONArray("results") }
+        if (results == null || results.length() == 0) results = get(path, mapOf("query" to query), until)?.optJSONArray("results")
+        if (results == null || results.length() == 0) return null
+
+        val q = normalize(query)
+        var best: Pair<Int, Double>? = null
+        for (i in 0 until minOf(results.length(), 10)) {
+            val r = results.optJSONObject(i) ?: continue
+            val names = listOfNotNull(
+                r.str(if (isSeries) "name" else "title"),
+                r.str(if (isSeries) "original_name" else "original_title"),
+            ).map { normalize(it) }.filter { it.isNotEmpty() }
+            var score = when {
+                names.any { it == q } -> 10.0
+                names.any { (it.length > 3 && q.contains(it)) || (q.length > 3 && it.contains(q)) } -> 4.0
+                else -> continue
+            }
+            val ry = r.str(if (isSeries) "first_air_date" else "release_date")?.take(4)?.toIntOrNull()
+            if (year != null && ry != null) score += when (kotlin.math.abs(ry - year)) {
+                0 -> 5.0; 1 -> 2.0; else -> -3.0
+            }
+            score -= i * 0.1
+            if (best == null || score > best.second) best = r.optInt("id") to score
+        }
+        return best?.first?.takeIf { it > 0 }
+    }
+
+    private fun parseCommon(d: JSONObject, isSeries: Boolean): TmdbMeta {
+        val genres = d.optJSONArray("genres").objects().mapNotNull { it.str("name") }
+        val cast = d.optJSONObject("credits")?.optJSONArray("cast").objects().take(20).map {
+            Triple(it.str("name") ?: "", it.str("character"), img(it.str("profile_path"), "w185"))
+        }.filter { it.first.isNotBlank() }
+        val videos = d.optJSONObject("videos")?.optJSONArray("results").objects()
+            .filter { it.str("site").equals("YouTube", true) && it.str("key") != null }
+            .sortedBy {
+                val typeRank = when (it.str("type")) { "Trailer" -> 0; "Teaser" -> 1; else -> 2 }
+                val langRank = if (it.str("iso_639_1") == "pt") 0 else 1
+                typeRank * 2 + langRank
+            }
+            .take(2)
+            .map { "https://www.youtube.com/watch?v=" + it.str("key") }
+        val date = d.str(if (isSeries) "first_air_date" else "release_date") ?: ""
+        val runtime = if (isSeries) d.optJSONArray("episode_run_time")?.optInt(0)?.takeIf { it > 0 }
+                      else d.optInt("runtime").takeIf { it > 0 }
+        val imdb = d.str("imdb_id")?.takeIf { it.startsWith("tt") }
+            ?: d.optJSONObject("external_ids")?.str("imdb_id")?.takeIf { it.startsWith("tt") }
+        return TmdbMeta(
+            id = d.optInt("id"),
+            title = d.str(if (isSeries) "name" else "title") ?: "",
+            overview = d.str("overview"),
+            poster = img(d.str("poster_path"), "w500"),
+            backdrop = img(d.str("backdrop_path"), "w1280"),
+            year = date.take(4).toIntOrNull(),
+            runtime = runtime,
+            vote = d.optDouble("vote_average").takeIf { !it.isNaN() && it > 0 },
+            genres = genres,
+            cast = cast,
+            trailers = videos,
+            imdbId = imdb,
+            episodes = emptyMap(),
+        )
+    }
+
+    private val APPEND = mapOf(
+        "append_to_response" to "credits,videos,external_ids",
+        "include_video_language" to "pt,en,null",
+    )
+
+    private suspend fun loadMovie(id: Int, until: Long): TmdbMeta? =
+        get("/movie/$id", APPEND, until)?.let { parseCommon(it, isSeries = false) }
+
+    private suspend fun loadTv(id: Int, seasons: List<Int>, until: Long): TmdbMeta? {
+        val details = get("/tv/$id", APPEND, until) ?: return null
+        val base = parseCommon(details, isSeries = true)
+        val eps = ConcurrentHashMap<Pair<Int, Int>, TmdbEpisode>()
+        seasons.amap { n ->
+            val season = runCatching { get("/tv/$id/season/$n", emptyMap(), until) }.getOrNull() ?: return@amap
+            season.optJSONArray("episodes").objects().forEach { e ->
+                val num = e.optInt("episode_number").takeIf { it > 0 } ?: return@forEach
+                eps[n to num] = TmdbEpisode(
+                    name = e.str("name"),
+                    overview = e.str("overview"),
+                    still = img(e.str("still_path"), "w300"),
+                    airDate = e.str("air_date")?.takeIf { it.length >= 10 },
+                    runtime = e.optInt("runtime").takeIf { it > 0 },
+                )
+            }
+        }
+        return base.copy(episodes = eps)
+    }
+
+    /** optString do Android devolve "null" para campo nulo: aqui vira null de verdade. */
+    private fun JSONObject.str(key: String): String? =
+        if (!has(key) || isNull(key)) null else optString(key).takeIf { it.isNotBlank() && it != "null" }
+
+    private fun JSONArray?.objects(): List<JSONObject> =
+        if (this == null) emptyList() else (0 until length()).mapNotNull { optJSONObject(it) }
 }
