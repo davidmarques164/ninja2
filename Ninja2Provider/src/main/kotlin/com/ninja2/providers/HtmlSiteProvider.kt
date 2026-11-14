@@ -32,13 +32,9 @@ import java.net.URLEncoder
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.cancellation.CancellationException
 
-/**
- * Provedor consolidado para o site ReDECanais / DavidCanais.
- * Otimizado para isolar lógicas estáticas via Jsoup e ignorar scripts de anúncios/VMs.
- */
 class HtmlSiteProvider : MainAPI() {
 
-    override var name = "Rede Canais V7"
+    override var name = "Rede Canais V8"
     override var mainUrl = "https://redecanais.by"
     override var lang = "pt-br"
     override val hasMainPage = true
@@ -51,6 +47,7 @@ class HtmlSiteProvider : MainAPI() {
         "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
         "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language" to "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+        "X-Requested-With" to "RC-Site-Requests",
     )
 
     override val mainPage = mainPageOf(
@@ -71,7 +68,6 @@ class HtmlSiteProvider : MainAPI() {
         "/browse-mgmplus-videos-1-date.html" to "Lionsgate+"
     )
 
-    // [FIX 1] Paginação real: troca o número da página no path.
     private fun pageUrl(base: String, path: String, page: Int): String =
         base + path.replace(PAGE_REGEX, "-$page-date.html")
 
@@ -84,7 +80,6 @@ class HtmlSiteProvider : MainAPI() {
         const val ITEM_TITLE = "h3 a, .caption h3 a, .title"
         const val ITEM_POSTER = "img"
 
-        // A CONFIRMAR no HTML real: inclui seletores PHP Melody além dos genéricos.
         const val PAGE_TITLE = "h1"
         const val PAGE_POSTER = "div.poster img, .pm-video-watch-featured img, .pm-video-thumb img"
         const val PAGE_PLOT = "div.sinopse, .pm-video-description, .description p, #content-main .description"
@@ -92,19 +87,14 @@ class HtmlSiteProvider : MainAPI() {
         const val PAGE_TAGS = ".entry-tags a, a[rel=tag], .pm-video-tags a"
         const val BREADCRUMB = ".breadcrumb a, ul.breadcrumb li a"
 
-        // Lista explícita de episódios (temas tipo WordPress).
         const val EPISODE_LIST_LINK = "ul.episodios li a, .episodes a"
-        // Links na descrição (padrão Rede Canais/PHP Melody); filtrados por texto "Episódio N".
         const val EPISODE_DESC_LINK = ".pm-video-description a[href], .pm-category-description a[href], #content-main .description a[href]"
-        // Cabeçalhos candidatos a "Temporada N", avaliados na ordem do documento.
         const val SEASON_HEADER = "strong, b, h2, h3, h4, span"
 
         const val PLAYER_CONTAINER = "#player, .player, .pm-video-watch-main, .embed-responsive, #video-player"
-        // [FIX 3] Sem [data-src] genérico (pegava <img> de lazy-load).
         const val PLAYER = "iframe[src], iframe[data-src], [data-player], [data-url]"
     }
 
-    // [FIX 10] Tipo inferido pela categoria quando a URL do item não traz pista.
     private fun typeFromUrl(href: String, hint: TvType? = null): TvType = when {
         "/series/" in href || "/browse-series-" in href || "lista-de-episodios" in href -> TvType.TvSeries
         "/animes/" in href || "/browse-animes-" in href -> TvType.Anime
@@ -125,9 +115,6 @@ class HtmlSiteProvider : MainAPI() {
         return mainUrl
     }
 
-    // ---------------------------------------------------------------- HTTP
-
-    /** [FIX 5] Fallback de domínio que funciona com HTTP != 2xx, respeita cancelamento e reescreve URLs antigas. */
     private suspend fun getDoc(url: String, referer: String? = null): Document {
         val current = base()
         val target = url.rehostIfOurs(current)
@@ -140,7 +127,6 @@ class HtmlSiteProvider : MainAPI() {
             ?: throw ErrorLoadingException("Falha ao carregar $target")
     }
 
-    /** null = falha atribuível ao domínio (rede, 403, 5xx); 404 é erro de conteúdo e não troca domínio. */
     private suspend fun fetch(url: String, referer: String?): Document? = try {
         val res = app.get(url, headers = headers, referer = referer)
         when {
@@ -156,15 +142,12 @@ class HtmlSiteProvider : MainAPI() {
         null
     }
 
-    /** Troca o host de URLs do próprio site (inclusive domínios antigos salvos em favoritos) pelo atual. */
     private fun String.rehostIfOurs(base: String): String = runCatching {
         val u = URI(this)
         val host = u.host ?: return this
         if (!host.contains(domainKey) || host.normHost() == URI(base).host.normHost()) return this
         base.trimEnd('/') + (u.rawPath ?: "") + (u.rawQuery?.let { "?$it" } ?: "")
     }.getOrDefault(this)
-
-    // ---------------------------------------------------------------- API
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val doc = getDoc(pageUrl(base(), request.data, page))
@@ -202,7 +185,6 @@ class HtmlSiteProvider : MainAPI() {
 
         val episodes = parseEpisodes(doc)
         return if (episodes.isNotEmpty()) {
-            // [FIX 11] Anime/Desenho detectado por breadcrumb/tags.
             val crumbs = (doc.select(Sel.BREADCRUMB).map { it.text() } + tags).joinToString(" ").lowercase()
             val type = if ("anime" in crumbs || "desenho" in crumbs) TvType.Anime else TvType.TvSeries
             newTvSeriesLoadResponse(title, pageUrl, type, episodes) {
@@ -224,7 +206,6 @@ class HtmlSiteProvider : MainAPI() {
         val doc = getDoc(data)
         val pageUrl = data.rehostIfOurs(mainUrl)
 
-        // Prioriza o container do player; cai para o documento inteiro se não existir.
         val scope: Element = doc.selectFirst(Sel.PLAYER_CONTAINER) ?: doc
         val candidates = scope.select(Sel.PLAYER).ifEmpty { doc.select(Sel.PLAYER) }
 
@@ -235,45 +216,45 @@ class HtmlSiteProvider : MainAPI() {
             .distinct()
 
         val found = AtomicBoolean(false)
-        // [Desempenho] Resolução em paralelo.
-        playerUrls.amap { url ->
-            val finalUrl = try {
-                resolveRedirects(url, referer = pageUrl)
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                url
-            }
 
-            // [FIX 4] Link direto de vídeo não tem extractor: entrega direto.
-            if (DIRECT_VIDEO_REGEX.containsMatchIn(finalUrl)) {
-                callback(
-                    newExtractorLink(
-                        source = name,
-                        name = name,
-                        url = finalUrl,
-                        type = if (".m3u8" in finalUrl) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO,
-                    ) {
-                        this.referer = pageUrl
-                        this.quality = Qualities.Unknown.value
-                    }
-                )
-                found.set(true)
-            } else if (loadExtractor(finalUrl, pageUrl, subtitleCallback, callback)) {
-                found.set(true)
+        playerUrls.amap { url ->
+            val vid = VID_REGEX.find(url)?.groupValues?.get(1)
+
+            val res = runCatching { app.get(url, headers = headers, referer = pageUrl) }.getOrNull()
+            val html = res?.text ?: ""
+            val resolvedUrl = runCatching { resolveRedirects(url, referer = pageUrl) }.getOrDefault(url)
+
+            val directVideoMatches = DIRECT_VIDEO_URL_REGEX.findAll(html).map { it.value }.toList()
+            val linksToTest = listOfNotNull(resolvedUrl) + directVideoMatches + listOfNotNull(vid?.let { "https://neosoro.gq/V/RCFServer3/ondemand/$it.mp4" })
+
+            for (link in linksToTest.distinct()) {
+                val cleanedLink = link.replace("\\/", "/")
+                if (DIRECT_VIDEO_REGEX.containsMatchIn(cleanedLink)) {
+                    callback(
+                        newExtractorLink(
+                            source = name,
+                            name = name,
+                            url = cleanedLink,
+                            type = if (".m3u8" in cleanedLink) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO,
+                        ) {
+                            this.referer = url
+                            this.quality = Qualities.Unknown.value
+                        }
+                    )
+                    found.set(true)
+                } else if (loadExtractor(cleanedLink, url, subtitleCallback, callback)) {
+                    found.set(true)
+                }
             }
         }
         return found.get()
     }
-
-    // ---------------------------------------------------------------- Parsing
 
     private fun Element.toSearchResult(host: String, hint: TvType?): SearchResponse? {
         val link = selectFirst(Sel.ITEM_LINK) ?: return null
         val href = fixUrl(link.attr("href"))
         val title = (selectFirst(Sel.ITEM_TITLE)?.text() ?: link.attr("title")).trim()
         if (title.isEmpty() || DomainManager.isBlocked(title)) return null
-        // [FIX 8] Comparação de host normalizada (www / subdomínio).
         val itemHost = runCatching { URI(href).host.normHost() }.getOrNull() ?: return null
         if (host.isNotEmpty() && itemHost != host && !itemHost.endsWith(".$host")) return null
 
@@ -281,10 +262,6 @@ class HtmlSiteProvider : MainAPI() {
         return newMovieSearchResponse(title, href, typeFromUrl(href, hint)) { posterUrl = fixUrlNull(poster) }
     }
 
-    /**
-     * Percorre cabeçalhos "Temporada N" e links de episódio na ordem do documento,
-     * atribuindo a temporada vigente a cada episódio.
-     */
     private fun parseEpisodes(doc: Document): List<Episode> {
         val listLinks = doc.select(Sel.EPISODE_LIST_LINK)
         val useList = listLinks.isNotEmpty()
@@ -298,7 +275,6 @@ class HtmlSiteProvider : MainAPI() {
         for (el in doc.select("${Sel.SEASON_HEADER}, $linkSelector")) {
             if (el.`is`(linkSelector)) {
                 val text = el.text().trim()
-                // Links da descrição só contam se parecerem episódio.
                 if (!useList && !EP_REGEX.containsMatchIn(text) && !SE_REGEX.containsMatchIn(text)) continue
                 val href = fixUrl(el.attr("href"))
                 if (!seen.add(href)) continue
@@ -330,15 +306,12 @@ class HtmlSiteProvider : MainAPI() {
             .map { attr(it).trim() }
             .firstOrNull { it.isNotBlank() && it != "about:blank" && !it.startsWith("javascript:") }
 
-    /** Só aceita "SxE" explícito; "Episódio N" mantém a temporada do cabeçalho. */
     private fun parseSeasonEpisode(text: String): Pair<Int?, Int>? {
         SE_REGEX.find(text)?.let { m ->
             return m.groupValues[1].toInt() to m.groupValues[2].toInt()
         }
         return EP_REGEX.find(text)?.groupValues?.get(1)?.toIntOrNull()?.let { null to it }
     }
-
-    // ---------------------------------------------------------------- Redirects
 
     private suspend fun resolveRedirects(url: String, referer: String, depth: Int = 0): String {
         if (depth >= MAX_REDIRECT_DEPTH || !url.isSameSite()) return url
@@ -350,13 +323,11 @@ class HtmlSiteProvider : MainAPI() {
         val html = res.text
         val doc = res.document
 
-        // [FIX 7] "URL=" em qualquer caixa.
         val metaRefresh = doc.selectFirst("meta[http-equiv~=(?i)refresh]")?.attr("content")
             ?.let { META_URL_REGEX.find(it)?.groupValues?.get(1) }
             ?.replace(QUOTES_REGEX, "")?.trim()
             ?.takeIf { it.isNotEmpty() }
 
-        // [FIX 9] Iframe do container do player primeiro.
         val iframe = (doc.selectFirst(Sel.PLAYER_CONTAINER)?.selectFirst("iframe") ?: doc.selectFirst("iframe"))
             ?.playerUrl()
 
@@ -367,7 +338,6 @@ class HtmlSiteProvider : MainAPI() {
             ?: return current
 
         if (next.isBlank()) return current
-        // [FIX 6] Relativo resolvido contra a página atual, não contra a raiz.
         return resolveRedirects(next.resolveAgainst(current), referer = current, depth = depth + 1)
     }
 
@@ -393,15 +363,15 @@ class HtmlSiteProvider : MainAPI() {
         const val MAX_REDIRECT_DEPTH = 4
         val PAGE_REGEX = Regex("-\\d+-date\\.html$")
         val YEAR_REGEX = Regex("\\b(19|20)\\d{2}\\b")
-        // Mais restrito: exige S/T opcional e separador típico (1x05, S01E05, T1E5).
         val SE_REGEX = Regex("(?i)\\b[st]?(\\d{1,2})\\s*[xe]\\s*(\\d{1,3})\\b")
         val EP_REGEX = Regex("(?i)\\bep(?:is[oó]dio)?\\.?\\s*(\\d+)")
         val SEASON_REGEX = Regex("(?i)temporada\\s*(\\d+)")
         val META_URL_REGEX = Regex("(?i)url\\s*=\\s*(.+)$")
         val DIRECT_VIDEO_REGEX = Regex("(?i)\\.(m3u8|mp4)(\\?|#|$)")
+        val VID_REGEX = Regex("vid=([A-Za-z0-9_-]+)")
+        val DIRECT_VIDEO_URL_REGEX = Regex("https?://[^\"'\\s]+\\.(?:mp4|m3u8)(?:\\?[^\"'\\s]*)?")
 
         val QUOTES_REGEX = Regex("[\\x22\\x27]")
-        // [FIX 2] Alternância restrita às aspas; inclui location.replace/assign.
         val JS_LOCATION_REGEX = Regex(
             "(?:window\\.|document\\.)?location(?:\\.href)?\\s*(?:=\\s*|\\.(?:replace|assign)\\(\\s*)(?:\\x22([^\\x22]+)\\x22|\\x27([^\\x27]+)\\x27)"
         )
