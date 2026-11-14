@@ -34,7 +34,7 @@ import kotlin.coroutines.cancellation.CancellationException
 
 class HtmlSiteProvider : MainAPI() {
 
-    override var name = "Rede Canais V8"
+    override var name = "Rede Canais V10"
     override var mainUrl = "https://redecanais.by"
     override var lang = "pt-br"
     override val hasMainPage = true
