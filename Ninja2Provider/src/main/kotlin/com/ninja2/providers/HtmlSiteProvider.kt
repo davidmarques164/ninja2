@@ -42,7 +42,7 @@ import kotlin.coroutines.cancellation.CancellationException
  */
 class HtmlSiteProvider : MainAPI() {
 
-    override var name = "Rede Canais V13"
+    override var name = "Rede Canais V14"
     override var mainUrl = "https://redecanais.by"
     override var lang = "pt-br"
     override val hasMainPage = true
@@ -788,7 +788,7 @@ class HtmlSiteProvider : MainAPI() {
          * O vídeo é pedido pelo service worker / pelo elemento <video>, e o WebView do Android
          * não repassa essas requisições ao interceptador. Então o script lê a URL no próprio
          * player e "avisa" navegando um iframe para um host sentinela, que o interceptador vê.
-         * Se em ~40 s não achar, avisa com ?err=<estado> para diagnóstico.
+         * Se em ~50 s não achar, avisa com ?err=<estado> para diagnóstico.
          */
         const val RC_CAPTURE_HOST = "rc-capture.invalid"
         val RC_INTERCEPT_REGEX = Regex("""rc-capture\.invalid|null-null\.shop/[^?\s]*proxy[^?\s]*\?|/__RC__/proxy\?src=""")
@@ -797,7 +797,7 @@ class HtmlSiteProvider : MainAPI() {
         val RC_CAPTURE_SCRIPT = """
             (function(){
               if (window.__rcCap) return 'dup'; window.__rcCap = 1;
-              var n = 0, H = 'https://$RC_CAPTURE_HOST/';
+              var n = 0, gate = 0, H = 'https://$RC_CAPTURE_HOST/';
               function ok(c){ return c && c.indexOf('blob:') !== 0 && !/servetraff|2mdn|doubleclick/.test(c)
                                 && /null-null|__RC__|\.mp4|\.m3u8/.test(c); }
               function send(q){
@@ -820,10 +820,16 @@ class HtmlSiteProvider : MainAPI() {
                     var ps = videojs.getPlayers();
                     for (var k in ps) { try { var c2 = ps[k] && ps[k].currentSrc(); if (ok(c2)) s = c2; } catch(e) {} }
                   }
-                  if (!s && n % 4 === 0) { var b = document.querySelector('.vjs-big-play-button, .vjs-play-control, [class*=play]'); if (b) b.click(); }
+                  if (!s) {
+                    // Portão de play do site: <button id="submit" class="captcha_button">. Sem esse
+                    // clique o player nunca pede o token (serverforms.api) nem cria o <video>.
+                    var g = document.querySelector('#player button#submit, button.captcha_button');
+                    if (g && (n === 2 || n % 30 === 0)) { gate++; g.click(); }  // reclica só a cada 15 s para não reiniciar o fluxo
+                    else if (!g && n % 6 === 0) { var b = document.querySelector('.vjs-big-play-button'); if (b) b.click(); }
+                  }
                   if (s) { clearInterval(t); send('u=' + encodeURIComponent(s)); return; }
                 } catch(e) {}
-                if (n >= 80) {
+                if (n >= 100) {
                   clearInterval(t);
                   var e1 = document.querySelector('.vjs-error-display, .vjs-modal-dialog-content');
                   var K = /serverforms|videojs\.4\.5\.2|null-null|__RC__|dns\.camera|probe/;
@@ -831,11 +837,16 @@ class HtmlSiteProvider : MainAPI() {
                   try {
                     performance.getEntriesByType('resource').forEach(function(r){
                       var m = r.name.match(K);
+                      if (m && /[?&](css|template|p0|core)=/.test(r.name)) return;
                       if (m) api.push(m[0].replace('videojs.4.5.2', 'ticket') + ':' + (r.responseStatus || '?') + '/' + Math.round(r.duration) + 'ms');
                     });
                   } catch(e) { api.push('perf-erro'); }
                   var body = document.body;
+                  var lb = document.querySelector('.rc-loader-label'), pc = document.querySelector('.rc-loader-percent');
                   var st = 'api=[' + (api.length ? api.join(',') : 'nenhuma') + ']'
+                    + ' cliques=' + gate
+                    + ' portao=' + !!document.querySelector('button.captcha_button')
+                    + ' progresso=' + (pc ? pc.textContent : '') + ' ' + (lb ? lb.textContent : '')
                     + ' videos=' + document.querySelectorAll('video').length
                     + ' videojs=' + !!window.videojs
                     + ' sw=' + !!(navigator.serviceWorker && navigator.serviceWorker.controller)
