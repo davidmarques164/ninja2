@@ -52,6 +52,10 @@ import java.net.Inet4Address
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.util.UUID
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executor
+import android.os.Handler
+import android.os.Looper
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.Socket
@@ -74,7 +78,7 @@ import java.util.concurrent.TimeUnit
  */
 class HtmlSiteProvider : MainAPI() {
 
-    override var name = "Rede Canais V24"
+    override var name = "Rede Canais V25"
     override var mainUrl = "https://redecanais.by"
     override var lang = "pt-br"
     override val hasMainPage = true
@@ -549,12 +553,30 @@ class HtmlSiteProvider : MainAPI() {
         addRcSubtitle(playerUrl, subtitleCallback)
 
         log("rc", "WebView em $playerUrl")
-        val result = safe("rc-webview") {
-            WebViewResolver(
-                interceptUrl = RC_INTERCEPT_REGEX,
-                useOkhttp = false,
-                script = RC_CAPTURE_SCRIPT,
-            ).resolveUsingWebView(playerUrl, referer)
+
+        // Rede com DNS bloqueado (ex.: 4G da operadora): o WebView usa o DNS do Android e cai na
+        // página "Sua operadora bloqueou". Só nesse caso o WebView passa pelo proxy local, que
+        // resolve pelo DNS sobre HTTPS. Com DNS ok (Wi-Fi, DNS privado), nada muda.
+        val siteHost = runCatching { URI(mainUrl).host }.getOrNull().orEmpty()
+        val blockReason = if (siteHost.isNotEmpty()) RcDns.dnsBlockReason(siteHost) else ""
+        val proxyOn = if (blockReason.isNotEmpty()) {
+            log("rc", "DNS do Android bloqueado ($blockReason): ligando proxy do WebView")
+            RcWebViewProxy.enable(RcLocalProxy.port(), blockReason)
+        } else {
+            RcWebViewProxy.status = "off (dns ok)"
+            false
+        }
+
+        val result = try {
+            safe("rc-webview") {
+                WebViewResolver(
+                    interceptUrl = RC_INTERCEPT_REGEX,
+                    useOkhttp = false,
+                    script = RC_CAPTURE_SCRIPT,
+                ).resolveUsingWebView(playerUrl, referer)
+            }
+        } finally {
+            if (proxyOn) RcWebViewProxy.disable()
         } ?: return debugLink("WebView falhou ao iniciar", callback)
 
         val intercepted = result.first?.url?.toString()
@@ -703,7 +725,7 @@ class HtmlSiteProvider : MainAPI() {
         callback(
             newExtractorLink(
                 source = name,
-                name = "[DEBUG] ${reason.take(400)}",
+                name = "[DEBUG] ${reason.take(400)} | webproxy=${RcWebViewProxy.status}",
                 url = "https://$RC_CAPTURE_HOST/debug.mp4",
                 type = ExtractorLinkType.VIDEO,
             )
@@ -1180,6 +1202,42 @@ object RcDns : Dns {
         throw firstError ?: UnknownHostException("$hostname: sem endereço IPv4")
     }
 
+    /** Para o túnel do WebView: DNS sobre HTTPS primeiro (o DNS do Android pode estar bloqueado). */
+    fun lookupTrusted(hostname: String): List<InetAddress> {
+        if (IP_LITERAL.matches(hostname)) return listOf(InetAddress.getByName(hostname))
+        val doh = dohLookupV4(hostname)
+        if (doh.isNotEmpty()) return doh
+        return lookup(hostname)
+    }
+
+    private val IP_LITERAL = Regex("""^(\d{1,3}(\.\d{1,3}){3}|[0-9a-fA-F:]+)$""")
+    private val blockCache = ConcurrentHashMap<String, Pair<Long, String>>()
+
+    /**
+     * "" = DNS do Android ok. Senão, o motivo: falhou, ou devolveu IPs que não batem com o
+     * DNS sobre HTTPS (operadora redirecionando para página de bloqueio). Cache de 2 min.
+     */
+    fun dnsBlockReason(host: String): String {
+        blockCache[host]?.let { (until, r) -> if (System.currentTimeMillis() < until) return r }
+        val reason = run {
+            val sys = try {
+                Dns.SYSTEM.lookup(host).filterIsInstance<Inet4Address>().mapNotNull { it.hostAddress }.toSet()
+            } catch (e: UnknownHostException) {
+                return@run "dns do android falhou"
+            }
+            val doh = dohLookupV4(host).mapNotNull { it.hostAddress }.toSet()
+            when {
+                doh.isEmpty() -> ""                     // sem referência: não liga nada
+                sys.isEmpty() -> ""                     // só IPv6 no sistema: não é bloqueio
+                (sys intersect doh).isEmpty() -> "dns do android=${sys.first()} doh=${doh.first()}"
+                else -> ""
+            }
+        }
+        blockCache[host] = (System.currentTimeMillis() + 120_000L) to reason
+        Log.d(TAG, "[dns] bloqueio($host) = ${reason.ifEmpty { "não" }}")
+        return reason
+    }
+
     private fun dohLookupV4(hostname: String): List<InetAddress> {
         for (endpoint in ENDPOINTS) {
             val ips = try {
@@ -1347,6 +1405,9 @@ object RcLocalProxy {
         return ss.localPort
     }
 
+    /** Porta do proxy local (sobe o servidor se preciso). */
+    fun port(): Int = start()
+
     fun register(url: String, headers: Map<String, String>): String {
         val port = start()
         val now = System.currentTimeMillis()
@@ -1374,6 +1435,84 @@ object RcLocalProxy {
         }
     }
 
+    /** CONNECT host:porta -> conecta resolvendo pelo DNS sobre HTTPS e repassa os bytes (TLS fica de ponta a ponta). */
+    private fun tunnel(c: Socket, input: java.io.InputStream, target: String) {
+        val host = target.substringBeforeLast(':').trim('[', ']')
+        val port = target.substringAfterLast(':').toIntOrNull() ?: 443
+        val remote = connectTrusted(host, port)
+        if (remote == null) {
+            c.getOutputStream().apply { write("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n".toByteArray()); flush() }
+            return
+        }
+        remote.use { r ->
+            c.soTimeout = 0
+            c.getOutputStream().apply { write("HTTP/1.1 200 Connection Established\r\n\r\n".toByteArray()); flush() }
+            relay(c, input, r)
+        }
+    }
+
+    /** Pedido HTTP comum via proxy ("GET http://host/caminho"): reenvia em forma de origem. */
+    private fun forwardHttp(c: Socket, input: java.io.InputStream, method: String, absUrl: String, rawHeaders: List<String>) {
+        val rest = absUrl.substringAfter("://")
+        val authority = rest.substringBefore('/')
+        val originForm = "/" + rest.substringAfter('/', "")
+        val host = authority.substringBeforeLast(':').trim('[', ']')
+        val port = if (':' in authority && !authority.endsWith(']')) authority.substringAfterLast(':').toIntOrNull() ?: 80 else 80
+        val remote = connectTrusted(host, port)
+        if (remote == null) {
+            c.getOutputStream().apply { write("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n".toByteArray()); flush() }
+            return
+        }
+        remote.use { r ->
+            val head = StringBuilder("$method $originForm HTTP/1.1\r\n")
+            rawHeaders.filterNot {
+                val n = it.substringBefore(':').trim().lowercase()
+                n == "proxy-connection" || n == "connection" || n == "keep-alive" || n.startsWith("proxy-")
+            }.forEach { head.append(it).append("\r\n") }
+            head.append("Connection: close\r\n\r\n")
+            r.getOutputStream().apply { write(head.toString().toByteArray()); flush() }
+            c.soTimeout = 0
+            relay(c, input, r)
+        }
+    }
+
+    private fun connectTrusted(host: String, port: Int): Socket? {
+        val ips = try { RcDns.lookupTrusted(host) } catch (e: Exception) { emptyList() }
+        for (ip in ips) {
+            try {
+                return Socket().apply { tcpNoDelay = true; connect(InetSocketAddress(ip, port), 10_000) }
+            } catch (e: Exception) {
+                Log.w(TAG, "[túnel] $host($ip):$port falhou: ${e.javaClass.simpleName}")
+            }
+        }
+        Log.w(TAG, "[túnel] sem conexão para $host:$port")
+        return null
+    }
+
+    /** Copia nos dois sentidos até um dos lados fechar. */
+    private fun relay(c: Socket, clientIn: java.io.InputStream, r: Socket) {
+        val back = Thread({
+            pipe(r.getInputStream(), c.getOutputStream())
+            runCatching { c.shutdownOutput() }
+        }, "rc-tunnel").apply { isDaemon = true; start() }
+        pipe(clientIn, r.getOutputStream())
+        runCatching { r.shutdownOutput() }
+        back.join(30_000)
+    }
+
+    private fun pipe(from: java.io.InputStream, to: java.io.OutputStream) {
+        val buf = ByteArray(32 * 1024)
+        try {
+            while (true) {
+                val n = from.read(buf)
+                if (n < 0) break
+                to.write(buf, 0, n)
+                to.flush()
+            }
+        } catch (_: Exception) {
+        }
+    }
+
     private fun handle(client: Socket) {
         try {
             client.use { c ->
@@ -1384,11 +1523,21 @@ object RcLocalProxy {
                 val method = requestLine.substringBefore(' ')
                 val path = requestLine.substringAfter(' ').substringBefore(' ')
                 val reqHeaders = HashMap<String, String>()
+                val rawHeaders = ArrayList<String>()
                 while (true) {
                     val line = readLine(input) ?: break
                     if (line.isEmpty()) break
+                    rawHeaders += line
                     val i = line.indexOf(':')
                     if (i > 0) reqHeaders[line.substring(0, i).trim().lowercase()] = line.substring(i + 1).trim()
+                }
+
+                // Modo proxy do WebView (só ligado em rede com DNS bloqueado)
+                if (method.equals("CONNECT", ignoreCase = true)) {
+                    tunnel(c, input, path); return
+                }
+                if (path.startsWith("http://", ignoreCase = true)) {
+                    forwardHttp(c, input, method, path, rawHeaders); return
                 }
 
                 val id = path.substringAfter("/v/").substringBefore('.').substringBefore('?')
@@ -1647,4 +1796,72 @@ object Tmdb {
 
     private fun JSONArray?.objects(): List<JSONObject> =
         if (this == null) emptyList() else (0 until length()).mapNotNull { optJSONObject(it) }
+}
+
+/**
+ * Liga/desliga o proxy de TODOS os WebViews do app (androidx.webkit.ProxyController),
+ * por reflexão: se o CloudStream não tiver o androidx.webkit, nada quebra (fica "indisponível").
+ * Usado só durante a captura do player e só em rede com DNS bloqueado.
+ */
+object RcWebViewProxy {
+    private const val TAG = "RedeCanais"
+
+    @Volatile var status: String = "não usado"
+
+    private fun onMain(block: () -> Unit) {
+        if (Looper.myLooper() == Looper.getMainLooper()) block() else Handler(Looper.getMainLooper()).post(block)
+    }
+
+    private val direct = Executor { it.run() }
+
+    fun enable(port: Int, reason: String): Boolean {
+        val latch = CountDownLatch(1)
+        var ok = false
+        onMain {
+            try {
+                val feature = Class.forName("androidx.webkit.WebViewFeature")
+                val supported = feature.getMethod("isFeatureSupported", String::class.java)
+                    .invoke(null, "PROXY_OVERRIDE") as Boolean
+                if (!supported) {
+                    status = "indisponível (WebView sem PROXY_OVERRIDE)"
+                    latch.countDown(); return@onMain
+                }
+                val builderCls = Class.forName("androidx.webkit.ProxyConfig\$Builder")
+                val builder = builderCls.getConstructor().newInstance()
+                builderCls.getMethod("addProxyRule", String::class.java).invoke(builder, "127.0.0.1:$port")
+                val config = builderCls.getMethod("build").invoke(builder)
+                val cfgCls = Class.forName("androidx.webkit.ProxyConfig")
+                val pcCls = Class.forName("androidx.webkit.ProxyController")
+                val pc = pcCls.getMethod("getInstance").invoke(null)
+                pcCls.getMethod("setProxyOverride", cfgCls, Executor::class.java, Runnable::class.java)
+                    .invoke(pc, config, direct, Runnable { latch.countDown() })
+                ok = true
+                status = "on ($reason)"
+            } catch (e: Throwable) {
+                status = "indisponível (${e.javaClass.simpleName})"
+                Log.w(TAG, "[webproxy] não deu para ligar: $e")
+                latch.countDown()
+            }
+        }
+        latch.await(3, TimeUnit.SECONDS)
+        Log.d(TAG, "[webproxy] $status")
+        return ok
+    }
+
+    fun disable() {
+        val latch = CountDownLatch(1)
+        onMain {
+            try {
+                val pcCls = Class.forName("androidx.webkit.ProxyController")
+                val pc = pcCls.getMethod("getInstance").invoke(null)
+                pcCls.getMethod("clearProxyOverride", Executor::class.java, Runnable::class.java)
+                    .invoke(pc, direct, Runnable { latch.countDown() })
+            } catch (e: Throwable) {
+                Log.w(TAG, "[webproxy] erro ao desligar: $e")
+                latch.countDown()
+            }
+        }
+        latch.await(3, TimeUnit.SECONDS)
+        Log.d(TAG, "[webproxy] desligado")
+    }
 }
