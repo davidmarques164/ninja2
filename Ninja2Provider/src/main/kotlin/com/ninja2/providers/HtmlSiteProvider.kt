@@ -41,6 +41,8 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.net.Inet4Address
 import java.net.InetSocketAddress
+import java.net.ServerSocket
+import java.util.UUID
 import java.net.Socket
 import java.net.SocketAddress
 import java.security.KeyStore
@@ -61,7 +63,7 @@ import java.util.concurrent.TimeUnit
  */
 class HtmlSiteProvider : MainAPI() {
 
-    override var name = "Rede Canais V19"
+    override var name = "Rede Canais V20"
     override var mainUrl = "https://redecanais.by"
     override var lang = "pt-br"
     override val hasMainPage = true
@@ -504,8 +506,25 @@ class HtmlSiteProvider : MainAPI() {
         val results = variants.amap { v -> v to preflight(v.url, "$site/", playHeaders + v.headers) }
         log("vídeo", "testes: ${results.map { it.first.label + "=" + it.second }}")
 
-        val working = results.filter { it.second.startsWith("2") }
-        val toEmit = working.ifEmpty { results.take(1) }   // nenhum passou: entrega o primeiro mesmo assim
+        // O player do app usa um cliente de rede próprio (sem o DNS/TLS do provider). Então a
+        // variante que passou no teste é servida por um proxy local em 127.0.0.1, que repassa
+        // cada pedido (Range) pelo cliente do app, onde o contorno funciona.
+        val allResults = results.toMutableList()
+        results.firstOrNull { it.second.startsWith("2") && it.first.label != "direto" }?.let { (v, _) ->
+            val upstreamHeaders = playHeaders + v.headers + mapOf(
+                "Referer" to "$site/",
+                "Accept-Encoding" to "identity",
+            )
+            val localUrl = safe("local") { RcLocalProxy.register(v.url, upstreamHeaders) }
+            if (localUrl != null) {
+                val res = preflight(localUrl, "$site/", emptyMap())
+                allResults.add(0, Variant("local", localUrl) to res)
+            }
+        }
+        log("vídeo", "com local: ${allResults.map { it.first.label + "=" + it.second }}")
+
+        val working = allResults.filter { it.second.startsWith("2") }
+        val toEmit = working.ifEmpty { allResults.take(1) }   // nenhum passou: entrega o primeiro mesmo assim
         for ((v, _) in toEmit) {
             callback(
                 newExtractorLink(
@@ -516,12 +535,12 @@ class HtmlSiteProvider : MainAPI() {
                 ) {
                     this.referer = "$site/"
                     this.quality = quality
-                    this.headers = playHeaders + v.headers
+                    this.headers = if (v.label == "local") emptyMap() else playHeaders + v.headers
                 }
             )
         }
         if (DEBUG_LINKS) {
-            debugLink("teste: " + results.joinToString(" | ") { "${it.first.label}=${it.second}" } +
+            debugLink("teste: " + allResults.joinToString(" | ") { "${it.first.label}=${it.second}" } +
                 " | dns: " + RcDns.report(), callback)
         }
         return true
@@ -1200,4 +1219,111 @@ class SniSafeSSLSocket(private val d: SSLSocket) : SSLSocket() {
     override fun isOutputShutdown(): Boolean = d.isOutputShutdown
     override fun getChannel(): java.nio.channels.SocketChannel? = d.channel
     override fun toString(): String = "SniSafeSSLSocket($d)"
+}
+
+/**
+ * Proxy HTTP local (127.0.0.1) para o player. O player recebe http://127.0.0.1:<porta>/v/<id>.mp4
+ * e cada pedido dele (com Range) é refeito pelo cliente de rede do app (app.baseClient), onde
+ * estão o DNS próprio, o IPv4 forçado e o contorno do nome com "_" no TLS.
+ */
+object RcLocalProxy {
+    private const val TAG = "RedeCanais"
+    private const val MAX_AGE_MS = 12 * 60 * 60 * 1000L
+
+    private class Target(val url: String, val headers: Map<String, String>, val created: Long)
+
+    private val targets = ConcurrentHashMap<String, Target>()
+    @Volatile private var server: ServerSocket? = null
+
+    @Synchronized
+    private fun start(): Int {
+        server?.takeIf { !it.isClosed }?.let { return it.localPort }
+        val ss = ServerSocket(0, 50, InetAddress.getByName("127.0.0.1"))
+        server = ss
+        Thread({ acceptLoop(ss) }, "rc-local-proxy").apply { isDaemon = true }.start()
+        Log.d(TAG, "[local] proxy em 127.0.0.1:${ss.localPort}")
+        return ss.localPort
+    }
+
+    fun register(url: String, headers: Map<String, String>): String {
+        val port = start()
+        val now = System.currentTimeMillis()
+        targets.entries.removeAll { now - it.value.created > MAX_AGE_MS }
+        val id = UUID.randomUUID().toString().replace("-", "").take(20)
+        targets[id] = Target(url, headers, now)
+        return "http://127.0.0.1:$port/v/$id.mp4"
+    }
+
+    private fun acceptLoop(ss: ServerSocket) {
+        while (!ss.isClosed) {
+            val client = try { ss.accept() } catch (e: Exception) { break }
+            Thread({ handle(client) }, "rc-local-conn").apply { isDaemon = true }.start()
+        }
+    }
+
+    private fun readLine(input: java.io.InputStream): String? {
+        val sb = StringBuilder()
+        while (true) {
+            val b = input.read()
+            if (b == -1) return if (sb.isEmpty()) null else sb.toString()
+            if (b == '\n'.code) return sb.toString().trimEnd('\r')
+            if (sb.length > 8192) return null
+            sb.append(b.toChar())
+        }
+    }
+
+    private fun handle(client: Socket) {
+        try {
+            client.use { c ->
+                c.soTimeout = 60_000
+                val input = java.io.BufferedInputStream(c.getInputStream())
+                val out = java.io.BufferedOutputStream(c.getOutputStream(), 64 * 1024)
+                val requestLine = readLine(input) ?: return
+                val method = requestLine.substringBefore(' ')
+                val path = requestLine.substringAfter(' ').substringBefore(' ')
+                val reqHeaders = HashMap<String, String>()
+                while (true) {
+                    val line = readLine(input) ?: break
+                    if (line.isEmpty()) break
+                    val i = line.indexOf(':')
+                    if (i > 0) reqHeaders[line.substring(0, i).trim().lowercase()] = line.substring(i + 1).trim()
+                }
+
+                val id = path.substringAfter("/v/").substringBefore('.').substringBefore('?')
+                val t = targets[id]
+                if (t == null) {
+                    out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
+                    out.flush(); return
+                }
+
+                val rb = Request.Builder().url(t.url)
+                t.headers.forEach { (k, v) -> rb.header(k, v) }
+                reqHeaders["range"]?.let { rb.header("Range", it) }
+                if (method == "HEAD") rb.head()
+
+                val resp = try {
+                    app.baseClient.newCall(rb.build()).execute()
+                } catch (e: Exception) {
+                    Log.w(TAG, "[local] upstream falhou: ${e.javaClass.simpleName}: ${e.message}")
+                    out.write("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
+                    out.flush(); return
+                }
+
+                resp.use { r ->
+                    val head = StringBuilder("HTTP/1.1 ${r.code} ${r.message.ifBlank { "OK" }}\r\n")
+                    for (h in listOf("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "Last-Modified", "ETag")) {
+                        r.header(h)?.let { head.append(h).append(": ").append(it).append("\r\n") }
+                    }
+                    if (r.header("Accept-Ranges") == null) head.append("Accept-Ranges: bytes\r\n")
+                    head.append("Connection: close\r\n\r\n")
+                    out.write(head.toString().toByteArray())
+                    if (method != "HEAD") r.body?.byteStream()?.use { it.copyTo(out, 64 * 1024) }
+                    out.flush()
+                }
+            }
+        } catch (e: Exception) {
+            // o player fecha a conexão ao buscar outro trecho (seek): esperado
+            Log.d(TAG, "[local] conexão encerrada: ${e.javaClass.simpleName}")
+        }
+    }
 }
