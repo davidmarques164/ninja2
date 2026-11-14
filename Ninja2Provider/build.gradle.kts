@@ -1,5 +1,5 @@
 // Versão do plugin: aumente a cada release para o app detectar a atualização.
-version = 20
+version = 21
 
 cloudstream {
     description = "Ninja 2 - provedores PT-BR baseados em páginas HTML/PHP"

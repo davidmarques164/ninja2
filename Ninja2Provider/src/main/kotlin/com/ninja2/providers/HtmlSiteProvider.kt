@@ -30,6 +30,8 @@ import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import org.jsoup.nodes.Node
+import org.jsoup.nodes.TextNode
 import java.net.URI
 import java.net.URLDecoder
 import java.net.URLEncoder
@@ -63,7 +65,7 @@ import java.util.concurrent.TimeUnit
  */
 class HtmlSiteProvider : MainAPI() {
 
-    override var name = "Rede Canais V20"
+    override var name = "Rede Canais V21"
     override var mainUrl = "https://redecanais.by"
     override var lang = "pt-br"
     override val hasMainPage = true
@@ -272,9 +274,10 @@ class HtmlSiteProvider : MainAPI() {
         val pageUrl = url.rehostIfOurs(mainUrl)
         val main: Element = doc.selectFirst(Sel.MAIN) ?: doc.body()
 
-        val title = doc.selectFirst(Sel.PAGE_TITLE)?.text()?.trim()?.takeIf { it.isNotEmpty() }
+        val rawTitle = doc.selectFirst(Sel.PAGE_TITLE)?.text()?.trim()?.takeIf { it.isNotEmpty() }
             ?: doc.metaContent("og:title")
             ?: throw ErrorLoadingException("Título não encontrado")
+        val title = rawTitle.replace(LIST_SUFFIX_REGEX, "").trim().ifEmpty { rawTitle }
 
         // Poster: 1) o mesmo da listagem  2) og:image  3) imagem do bloco principal
         val posterCandidates = listOf(
@@ -285,7 +288,12 @@ class HtmlSiteProvider : MainAPI() {
         val poster = pick(posterCandidates, GENERIC_IMG_REGEX)
 
         // Descrição: [itemprop=description] tem o texto completo; og:description vem cortado com "..."
-        val plotCandidates = listOf(
+        // Em série, [itemprop=description] é a lista de episódios: a sinopse fica nas metas.
+        val episodes = parseEpisodes(main)
+        val plotCandidates = if (episodes.isNotEmpty()) listOf(
+            "og:description" to doc.metaContent("og:description"),
+            "description" to doc.metaContent("description"),
+        ) else listOf(
             "itemprop" to doc.selectFirst(Sel.PAGE_PLOT)?.text()?.trim()?.takeIf { it.isNotEmpty() },
             "og:description" to doc.metaContent("og:description"),
             "description" to doc.metaContent("description"),
@@ -300,7 +308,6 @@ class HtmlSiteProvider : MainAPI() {
             .let { YEAR_REGEX.find(it)?.value?.toIntOrNull() }
         val tags = main.select(Sel.PAGE_TAGS).map { it.text().trim() }.filter { it.isNotEmpty() }.distinct()
 
-        val episodes = parseEpisodes(main)
         log("load", "episódios=${episodes.size}")
 
         return if (episodes.isNotEmpty()) {
@@ -346,17 +353,28 @@ class HtmlSiteProvider : MainAPI() {
 
         for (el in root.select("${Sel.SEASON_HEADER}, $linkSelector")) {
             if (el.`is`(linkSelector)) {
-                val text = el.text().trim()
+                // Na descrição o link é só "Assistir"; número e nome ficam no texto da mesma
+                // linha, antes do link: "<strong>Episódio 01 - </strong>Nome - <a>Assistir</a><br>"
+                val prefix = if (useList) "" else lineTextBefore(el)
+                val text = if (useList) el.text().trim() else "$prefix ${el.text()}".trim()
                 if (!useList && !EP_REGEX.containsMatchIn(text) && !SE_REGEX.containsMatchIn(text)) continue
                 val href = fixUrl(el.attr("href")).rehostIfOurs(mainUrl)
                 if (!seen.add(href)) continue
 
-                val parsed = parseSeasonEpisode(text)
+                val epAtStart = EP_REGEX.find(text)?.takeIf { it.range.first <= 3 }
+                val parsed = if (epAtStart != null) null to epAtStart.groupValues[1].toInt()
+                             else parseSeasonEpisode(text)
                 val season = parsed?.first ?: currentSeason
                 val number = parsed?.second ?: ((counters[season] ?: 0) + 1)
                 counters[season] = maxOf(counters[season] ?: 0, number)
 
-                val name = text.replace(EP_SUFFIX_REGEX, "").ifBlank { text }
+                val name = if (!useList && prefix.isNotBlank()) {
+                    val afterNum = EP_REGEX.find(prefix)?.let { prefix.substring(it.range.last + 1) } ?: prefix
+                    afterNum.trim().trim('-', '–', '|', ' ').trim().replace(EP_SUFFIX_REGEX, "")
+                        .ifBlank { "Episódio $number" }
+                } else {
+                    text.replace(EP_SUFFIX_REGEX, "").ifBlank { text }
+                }
                 grouped.getOrPut(season to number) { EpisodeAcc(name) }.urls += href
             } else if (el.children().size <= 1) {
                 SEASON_REGEX.find(el.ownText())?.let { m ->
@@ -372,6 +390,21 @@ class HtmlSiteProvider : MainAPI() {
                 this.episode = key.second
             }
         }
+    }
+
+    /** Texto da mesma "linha" antes do elemento: irmãos anteriores até o <br> (ou início do bloco). */
+    private fun lineTextBefore(el: Element): String {
+        val parts = ArrayList<String>()
+        var n: Node? = el.previousSibling()
+        while (n != null) {
+            if (n is Element && n.tagName().equals("br", ignoreCase = true)) break
+            when (n) {
+                is TextNode -> parts.add(n.text())
+                is Element -> if (!n.tagName().equals("img", ignoreCase = true)) parts.add(n.text())
+            }
+            n = n.previousSibling()
+        }
+        return parts.asReversed().joinToString("").replace('\u00a0', ' ').replace(Regex("\\s+"), " ").trim()
     }
 
     private fun parseSeasonEpisode(text: String): Pair<Int?, Int>? {
@@ -859,6 +892,7 @@ class HtmlSiteProvider : MainAPI() {
         /** "Temporada 2" ou "2ª Temporada" */
         val SEASON_REGEX = Regex("""(?i)(?:temporada\s*(\d+)|(\d+)\s*[ªºa°]?\s*temporada)""")
 
+        val LIST_SUFFIX_REGEX = Regex("""(?i)\s*[-–]\s*lista\s+de\s+epis[oó]dios\s*$""")
         val EP_SUFFIX_REGEX = Regex("""(?i)\s*[-–|]?\s*\(?\b(?:dublado|legendado|dub|leg)\b\)?\s*$""")
 
         val META_URL_REGEX = Regex("""(?i)url\s*=\s*(.+)$""")
@@ -963,7 +997,7 @@ class HtmlSiteProvider : MainAPI() {
         """.trimIndent()
 
         /** true = mostra o motivo da falha como um "link" na lista de fontes (sem precisar de adb). */
-        const val DEBUG_LINKS = true
+        const val DEBUG_LINKS = false
 
         val GENERIC_IMG_REGEX = Regex("""(?i)(logo|favicon|default|placeholder|no-?image|banner)""")
         val GENERIC_TEXT_REGEX = Regex("""(?i)rede\s*canais""")
