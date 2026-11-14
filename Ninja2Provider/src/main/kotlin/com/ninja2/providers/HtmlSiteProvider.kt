@@ -36,13 +36,19 @@ import java.net.URLEncoder
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.cancellation.CancellationException
+import okhttp3.Dns
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import java.net.InetAddress
+import java.net.UnknownHostException
+import java.util.concurrent.TimeUnit
 
 /**
  * Logs: adb logcat -s RedeCanais
  */
 class HtmlSiteProvider : MainAPI() {
 
-    override var name = "Rede Canais V15"
+    override var name = "Rede Canais V16"
     override var mainUrl = "https://redecanais.by"
     override var lang = "pt-br"
     override val hasMainPage = true
@@ -372,6 +378,7 @@ class HtmlSiteProvider : MainAPI() {
     ): Boolean {
         val found = AtomicBoolean(false)
         val emitted: MutableSet<String> = ConcurrentHashMap.newKeySet()
+        RcDns.install()
         val pages = data.split(DATA_SEP).map { it.trim() }.filter { it.isNotEmpty() }
         log("loadLinks", "início: ${pages.size} página(s) $pages")
 
@@ -502,7 +509,7 @@ class HtmlSiteProvider : MainAPI() {
         }
         if (DEBUG_LINKS) {
             debugLink("teste: " + results.joinToString(" | ") { "${it.first}=${it.third}" } +
-                " | host=" + runCatching { URI(videoUrl).authority }.getOrNull(), callback)
+                " | dns: " + RcDns.report(), callback)
         }
         return true
     }
@@ -930,5 +937,88 @@ class HtmlSiteProvider : MainAPI() {
         val BASE64_REGEX = Regex(
             """atob\(\s*(?:"([A-Za-z0-9+/=]{16,})"|'([A-Za-z0-9+/=]{16,})')\s*\)"""
         )
+    }
+}
+
+/**
+ * DNS de reserva: usa o DNS atual do app e, se ele falhar (bloqueio da operadora,
+ * DNS do Android que rejeita nomes como "-_kerberos-__tcp...null-null.shop"),
+ * consulta DNS sobre HTTPS direto por IP (1.1.1.1 / 8.8.8.8), sem depender de nenhum DNS.
+ *
+ * É instalado no cliente global do app (app.baseClient), que também é usado pelo player;
+ * só age quando o DNS normal falha, então não muda nada para os outros sites.
+ */
+object RcDns : Dns {
+    private const val TAG = "RedeCanais"
+    private val ENDPOINTS = listOf(
+        "https://1.1.1.1/dns-query?type=A&name=",
+        "https://8.8.8.8/resolve?type=A&name=",
+        "https://1.0.0.1/dns-query?type=A&name=",
+    )
+    private val A_RECORD = Regex("""\"type\"\s*:\s*1\s*,[^}]*?\"data\"\s*:\s*\"(\d{1,3}(?:\.\d{1,3}){3})\"""")
+
+    @Volatile private var fallback: Dns = Dns.SYSTEM
+    private val cache = ConcurrentHashMap<String, Pair<Long, List<InetAddress>>>()
+    private val lastResult = ConcurrentHashMap<String, String>()
+
+    private val dohClient by lazy {
+        OkHttpClient.Builder()
+            .dns(Dns.SYSTEM) // os endpoints são IPs; não há nome para resolver
+            .connectTimeout(6, TimeUnit.SECONDS)
+            .readTimeout(6, TimeUnit.SECONDS)
+            .build()
+    }
+
+    /** Coloca o RcDns no cliente global do app (uma vez; reinstala se o app trocar o cliente). */
+    fun install() {
+        val client = app.baseClient
+        if (client.dns is RcDns) return
+        fallback = client.dns
+        app.baseClient = client.newBuilder().dns(this).build()
+        Log.d(TAG, "[dns] RcDns instalado (anterior: ${fallback.javaClass.simpleName})")
+    }
+
+    override fun lookup(hostname: String): List<InetAddress> {
+        cache[hostname]?.let { (until, ips) -> if (System.currentTimeMillis() < until) return ips }
+
+        val firstError = try {
+            return fallback.lookup(hostname).also { lastResult[hostname] = "sistema" }
+        } catch (e: UnknownHostException) {
+            e
+        }
+
+        for (endpoint in ENDPOINTS) {
+            val ips = try {
+                val req = Request.Builder()
+                    .url(endpoint + java.net.URLEncoder.encode(hostname, "UTF-8"))
+                    .header("Accept", "application/dns-json")
+                    .build()
+                val body = dohClient.newCall(req).execute().use { it.body?.string() }.orEmpty()
+                A_RECORD.findAll(body).map { m ->
+                    val b = m.groupValues[1].split('.').map { it.toInt().toByte() }.toByteArray()
+                    InetAddress.getByAddress(hostname, b)
+                }.toList()
+            } catch (e: Exception) {
+                Log.w(TAG, "[dns] $endpoint falhou: ${e.javaClass.simpleName}: ${e.message}")
+                emptyList()
+            }
+            if (ips.isNotEmpty()) {
+                val via = endpoint.substringAfter("//").substringBefore('/')
+                lastResult[hostname] = "doh $via"
+                Log.d(TAG, "[dns] $hostname -> ${ips.map { it.hostAddress }} via $via")
+                cache[hostname] = (System.currentTimeMillis() + 5 * 60_000L) to ips
+                return ips
+            }
+        }
+        lastResult[hostname] = "falhou"
+        throw firstError
+    }
+
+    /** Resumo para o [DEBUG]: como cada host foi resolvido. */
+    fun report(): String {
+        val installed = app.baseClient.dns is RcDns
+        val hosts = lastResult.entries.filter { "null-null" in it.key || "neosoro" in it.key }
+            .joinToString(", ") { (h, r) -> (if (h.length > 24) "…" + h.takeLast(20) else h) + "=" + r }
+        return "instalado=$installed ${hosts.ifEmpty { "(nenhuma consulta)" }}"
     }
 }
