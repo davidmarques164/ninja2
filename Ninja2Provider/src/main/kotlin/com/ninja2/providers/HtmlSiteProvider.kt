@@ -74,7 +74,7 @@ import java.util.concurrent.TimeUnit
  */
 class HtmlSiteProvider : MainAPI() {
 
-    override var name = "Rede Canais V23"
+    override var name = "Rede Canais V24"
     override var mainUrl = "https://redecanais.by"
     override var lang = "pt-br"
     override val hasMainPage = true
@@ -622,7 +622,17 @@ class HtmlSiteProvider : MainAPI() {
             )
         }
         if (DEBUG_LINKS) {
+            // IP gravado na assinatura do link x IP público atual (via IPv4, como o vídeo é pedido).
+            // Diferentes = a operadora (CGNAT) trocou o IP e o proxy recusa com 403.
+            val decodedUrl = runCatching { URLDecoder.decode(videoUrl, "UTF-8") }.getOrDefault(videoUrl)
+            val linkIp = LINK_IP_REGEX.find(decodedUrl)?.groupValues?.get(1) ?: "?"
+            val linkIp6 = LINK_IP6_REGEX.find(decodedUrl)?.groupValues?.get(1).orEmpty()
+            val nowIp = safe("ip") {
+                TRACE_IP_REGEX.find(app.get("https://1.1.1.1/cdn-cgi/trace", timeout = 6L).text)?.groupValues?.get(1)
+            } ?: "?"
             debugLink("teste: " + allResults.joinToString(" | ") { "${it.first.label}=${it.second}" } +
+                " | ip-link=$linkIp" + (if (linkIp6.isNotEmpty()) " ipv6-link=$linkIp6" else "") +
+                " ip-agora=$nowIp" + (if (linkIp != "?" && nowIp != "?" && linkIp != nowIp) " (DIFERENTE)" else "") +
                 " | dns: " + RcDns.report(), callback)
         }
         return true
@@ -941,6 +951,10 @@ class HtmlSiteProvider : MainAPI() {
         /** "Temporada 2" ou "2ª Temporada" */
         val SEASON_REGEX = Regex("""(?i)(?:temporada\s*(\d+)|(\d+)\s*[ªºa°]?\s*temporada)""")
 
+        /** IP gravado na assinatura do link do vídeo (parâmetros ip= e ipv6=). */
+        val LINK_IP_REGEX = Regex("""[?&]ip=([0-9.]+)""")
+        val LINK_IP6_REGEX = Regex("""[?&]ipv6=([0-9a-fA-F:]+)""")
+        val TRACE_IP_REGEX = Regex("""(?m)^ip=(\S+)""")
         /** Texto que é lista de episódios, não sinopse. */
         val LIST_PLOT_REGEX = Regex("""(?i)assistir|(?:epis[oó]dio\s*\d+[\s\S]*){2}""")
         val GENERIC_EP_NAME_REGEX = Regex("""(?i)^\s*epis[oó]dio\s*\d+\s*$""")
@@ -1051,7 +1065,7 @@ class HtmlSiteProvider : MainAPI() {
         """.trimIndent()
 
         /** true = mostra o motivo da falha como um "link" na lista de fontes (sem precisar de adb). */
-        const val DEBUG_LINKS = false
+        const val DEBUG_LINKS = true
 
         val GENERIC_IMG_REGEX = Regex("""(?i)(logo|favicon|default|placeholder|no-?image|banner)""")
         val GENERIC_TEXT_REGEX = Regex("""(?i)rede\s*canais""")
@@ -1398,6 +1412,7 @@ object RcLocalProxy {
                 }
 
                 resp.use { r ->
+                    if (r.code >= 400) Log.w(TAG, "[local] upstream HTTP ${r.code} para ${t.url.take(80)}")
                     val head = StringBuilder("HTTP/1.1 ${r.code} ${r.message.ifBlank { "OK" }}\r\n")
                     for (h in listOf("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "Last-Modified", "ETag")) {
                         r.header(h)?.let { head.append(h).append(": ").append(it).append("\r\n") }
