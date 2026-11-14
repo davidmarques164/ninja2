@@ -61,7 +61,7 @@ import java.util.concurrent.TimeUnit
  */
 class HtmlSiteProvider : MainAPI() {
 
-    override var name = "Rede Canais V18"
+    override var name = "Rede Canais V19"
     override var mainUrl = "https://redecanais.by"
     override var lang = "pt-br"
     override val hasMainPage = true
@@ -498,57 +498,76 @@ class HtmlSiteProvider : MainAPI() {
             RC_HEADER_NAME to RC_HEADER_VALUE,
         )
 
-        // O host do proxy ("-_kerberos-__tcp-...null-null.shop") começa com hífen e tem "_";
-        // o DNS do Android pode recusar. Testa o original e variantes antes de entregar.
+        // O host do proxy ("-_kerberos-__tcp-...null-null.shop") tem "_": o TLS do Android
+        // recusa esse nome. Testa o original e variantes antes de entregar.
         val variants = rcVariants(videoUrl)
-        val results = variants.amap { (label, u) -> Triple(label, u, preflight(u, "$site/", playHeaders)) }
-        log("vídeo", "testes: ${results.map { it.first + "=" + it.third }}")
+        val results = variants.amap { v -> v to preflight(v.url, "$site/", playHeaders + v.headers) }
+        log("vídeo", "testes: ${results.map { it.first.label + "=" + it.second }}")
 
-        val working = results.filter { it.third.startsWith("2") }
-        val toEmit = working.ifEmpty { results.take(1) }   // nenhum passou: entrega o original mesmo assim
-        for ((label, u, _) in toEmit) {
+        val working = results.filter { it.second.startsWith("2") }
+        val toEmit = working.ifEmpty { results.take(1) }   // nenhum passou: entrega o primeiro mesmo assim
+        for ((v, _) in toEmit) {
             callback(
                 newExtractorLink(
                     source = name,
-                    name = "$name $label",
-                    url = u,
+                    name = "$name ${v.label}",
+                    url = v.url,
                     type = ExtractorLinkType.VIDEO,
                 ) {
                     this.referer = "$site/"
                     this.quality = quality
-                    this.headers = playHeaders
+                    this.headers = playHeaders + v.headers
                 }
             )
         }
         if (DEBUG_LINKS) {
-            debugLink("teste: " + results.joinToString(" | ") { "${it.first}=${it.third}" } +
+            debugLink("teste: " + results.joinToString(" | ") { "${it.first.label}=${it.second}" } +
                 " | dns: " + RcDns.report(), callback)
         }
         return true
     }
 
+    private data class Variant(val label: String, val url: String, val headers: Map<String, String> = emptyMap())
+
     /**
-     * Variantes do mesmo link assinado:
+     * Variantes do mesmo link assinado (em ordem de preferência):
+     *  proxy-sni -> mesmo caminho em "rcv.<domínio>" (nome válido, coberto pelo certificado
+     *               *.<domínio>); o DNS próprio aponta esse nome para os IPs do host real,
+     *               e o host real vai no header Host. Evita o nome com "_" no TLS.
      *  proxy     -> URL original
-     *  direto    -> URL de origem que está dentro do parâmetro url= (neosoro.gq)
+     *  direto    -> URL de origem dentro do parâmetro url= (neosoro.gq)
      */
-    private fun rcVariants(videoUrl: String): List<Pair<String, String>> {
-        val out = mutableListOf("proxy" to videoUrl)
+    private fun rcVariants(videoUrl: String): List<Variant> {
+        val out = mutableListOf<Variant>()
+        val realHost = videoUrl.substringAfter("://").substringBefore('/').substringBefore(':')
+        val root = realHost.split('.').takeLast(2).joinToString(".")
+        if (!isValidSni(realHost) && realHost.count { it == '.' } >= 2) {
+            val alias = "rcv.$root"
+            RcDns.alias(alias, realHost)
+            out += Variant("proxy-sni", videoUrl.replaceFirst(realHost, alias), mapOf("Host" to realHost))
+        }
+        out += Variant("proxy", videoUrl)
         INNER_URL_REGEX.find(videoUrl)?.groupValues?.get(1)?.let { inner ->
             val decoded = if (inner.startsWith("http")) inner else URLDecoder.decode(inner, "UTF-8")
-            if (decoded.startsWith("http")) out += "direto" to decoded
+            if (decoded.startsWith("http")) out += Variant("direto", decoded)
         }
-        return out.distinctBy { it.second }
+        return out.distinctBy { it.url }
     }
 
-    /** GET com Range de 2 bytes. Devolve o status HTTP ou o nome da exceção (ex.: UnknownHostException). */
+    private fun isValidSni(host: String) = runCatching { SNIHostName(host) }.isSuccess
+
+    /** GET com Range de 2 bytes. Devolve o status HTTP ou a causa raiz da exceção + onde ocorreu. */
     private suspend fun preflight(url: String, referer: String, headers: Map<String, String>): String = try {
         val res = app.get(url, headers = headers + ("Range" to "bytes=0-1"), referer = referer, timeout = 15L)
         res.code.toString()
     } catch (e: CancellationException) {
         throw e
     } catch (e: Exception) {
-        e.javaClass.simpleName + (e.message?.let { ":" + it.take(50) } ?: "")
+        var root: Throwable = e
+        while (root.cause != null && root.cause !== root) root = root.cause!!
+        val at = root.stackTrace.take(2).joinToString(">") { it.className.substringAfterLast('.') + "." + it.methodName }
+        Log.w(TAG, "[preflight] $url", e)
+        e.javaClass.simpleName + " / raiz=" + root.javaClass.simpleName + ":" + (root.message?.take(60) ?: "") + " @" + at
     }
 
     /** Legenda em /player3/RedeCanaisVTTS/vtts/<server>/<vid>.vtt (só se existir). */
@@ -996,7 +1015,21 @@ object RcDns : Dns {
     /** Hosts do vídeo: o link é assinado para o IPv4 do cliente (ip=...&ipv6=), então só IPv4. */
     private val IPV4_ONLY = Regex("""(^|\.)(null-null\.shop|neosoro\.[a-z]+)$""", RegexOption.IGNORE_CASE)
 
+    /** Nome falso -> host real (ex.: rcv.null-null.shop -> -_kerberos-...null-null.shop). */
+    private val aliases = ConcurrentHashMap<String, String>()
+
+    fun alias(fake: String, real: String) {
+        aliases[fake.lowercase()] = real
+    }
+
     override fun lookup(hostname: String): List<InetAddress> {
+        aliases[hostname.lowercase()]?.let { real ->
+            val ips = lookup(real).filterIsInstance<Inet4Address>()
+                .map { InetAddress.getByAddress(hostname, it.address) }
+            if (ips.isEmpty()) throw UnknownHostException("$hostname -> $real: sem IPv4")
+            lastResult[hostname] = "alias de " + (if (real.length > 20) "…" + real.takeLast(16) else real)
+            return ips
+        }
         cache[hostname]?.let { (until, ips) -> if (System.currentTimeMillis() < until) return ips }
         val v4only = IPV4_ONLY.containsMatchIn(hostname)
 
@@ -1056,7 +1089,7 @@ object RcDns : Dns {
     /** Resumo para o [DEBUG]: como cada host foi resolvido. */
     fun report(): String {
         val installed = app.baseClient.dns is RcDns
-        val hosts = lastResult.entries.filter { "null-null" in it.key || "neosoro" in it.key }
+        val hosts = lastResult.entries.filter { "null-null" in it.key || "neosoro" in it.key || it.key.startsWith("rcv.") }
             .joinToString(", ") { (h, r) -> (if (h.length > 24) "…" + h.takeLast(20) else h) + "=" + r }
         return "instalado=$installed sni=$sniPatched ${hosts.ifEmpty { "(nenhuma consulta)" }}"
     }
