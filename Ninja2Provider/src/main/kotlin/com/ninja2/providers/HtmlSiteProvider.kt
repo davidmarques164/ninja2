@@ -78,7 +78,7 @@ import java.util.concurrent.TimeUnit
  */
 class HtmlSiteProvider : MainAPI() {
 
-    override var name = "Rede Canais V25"
+    override var name = "Rede Canais V27"
     override var mainUrl = "https://redecanais.by"
     override var lang = "pt-br"
     override val hasMainPage = true
@@ -255,12 +255,57 @@ class HtmlSiteProvider : MainAPI() {
         return newHomePageResponse(request.name, items, hasNext = hasNext)
     }
 
+    /**
+     * A busca do site é feita no navegador: search.php vem com a lista vazia e um script baixa o
+     * catálogo inteiro (final_mapafilmes.txt e final_mapa.txt) e filtra por título. O provider faz
+     * o mesmo: baixa os dois arquivos (cache de 6 h) e filtra aqui.
+     */
     override suspend fun search(query: String): List<SearchResponse> {
-        val doc = getDoc(searchUrl(base(), query))
-        val host = currentHost()
-        return doc.select(Sel.LIST_ITEM)
-            .mapNotNull { it.toSearchResult(host, null) }
-            .distinctBy { it.url }
+        val q = Tmdb.normalizeWords(query)
+        if (q.isEmpty()) return emptyList()
+        val words = q.split(' ').filter { it.isNotEmpty() }
+
+        val catalog = safe("catálogo") { Catalog.get(base(), siteHeaders) }.orEmpty()
+        log("busca", "\"$query\" catálogo=${catalog.size}")
+        if (catalog.isEmpty()) {
+            // Reserva: busca antiga pelo HTML (caso o site volte a renderizar resultados no servidor)
+            val doc = getDoc(searchUrl(base(), query))
+            val host = currentHost()
+            return doc.select(Sel.LIST_ITEM).mapNotNull { it.toSearchResult(host, null) }.distinctBy { it.url }
+        }
+
+        val qCompact = q.replace(" ", "")
+        val hits = catalog.filter { e -> words.all { it in e.norm } || (qCompact.length >= 4 && qCompact in e.compact) }
+            .sortedWith(compareBy<Catalog.Entry>(
+                { if (it.norm.startsWith(q) || it.compact.startsWith(qCompact)) 0 else if (q in it.norm) 1 else 2 },
+                { it.norm.length },
+            ))
+            .take(SEARCH_LIMIT)
+            .filterNot { DomainManager.isBlocked(it.title) }
+
+        // Pôster pelo TMDB para os primeiros resultados: em paralelo, com prazo total curto.
+        // O que não chegar a tempo (ou não bater com segurança) fica sem pôster.
+        val tmdbPosters: Map<String, String> = if (TMDB_API_KEY.isNotBlank()) {
+            val until = System.currentTimeMillis() + SEARCH_POSTER_TIMEOUT_MS
+            hits.take(SEARCH_POSTER_COUNT)
+                .filter { posterCache[fixUrl(it.path).rehostIfOurs(mainUrl).pathKey()] == null }
+                .amap { e ->
+                    val y = YEAR_REGEX.find(e.title)?.value?.toIntOrNull()
+                    e.path to safe("poster-busca") { Tmdb.posterFor(e.title, y, e.type != TvType.Movie, until) }
+                }
+                .mapNotNull { (path, poster) -> poster?.let { path to it } }
+                .toMap()
+        } else emptyMap()
+        log("busca", "pôsteres do TMDB: ${tmdbPosters.size}/${minOf(hits.size, SEARCH_POSTER_COUNT)}")
+
+        return hits.map { e ->
+            val href = fixUrl(e.path).rehostIfOurs(mainUrl)
+            val poster = posterCache[href.pathKey()]
+                ?: tmdbPosters[e.path]?.also { posterCache[href.pathKey()] = it }
+            newMovieSearchResponse(e.title, href, e.type) {
+                posterUrl = poster
+            }
+        }.distinctBy { it.url }
     }
 
     private fun Element.toSearchResult(host: String, hint: TvType?): SearchResponse? {
@@ -283,6 +328,9 @@ class HtmlSiteProvider : MainAPI() {
     // ---------------------------------------------------------------- detalhes
 
     override suspend fun load(url: String): LoadResponse {
+        // Séries/animes/desenhos/novelas da busca apontam para a página de categoria da série
+        if (BROWSE_URL_REGEX.containsMatchIn(url)) return loadBrowse(url)
+
         val doc = getDoc(url)
         val pageUrl = url.rehostIfOurs(mainUrl)
         val main: Element = doc.selectFirst(Sel.MAIN) ?: doc.body()
@@ -320,7 +368,104 @@ class HtmlSiteProvider : MainAPI() {
         val year = (main.selectFirst(Sel.PAGE_YEAR)?.text() ?: title)
             .let { YEAR_REGEX.find(it)?.value?.toIntOrNull() }
         val tags = main.select(Sel.PAGE_TAGS).map { it.text().trim() }.filter { it.isNotEmpty() }.distinct()
+        val crumbs = (doc.select(Sel.BREADCRUMB).map { it.text() } + tags).joinToString(" ").lowercase()
 
+        return buildResponse(title, pageUrl, poster, plot, year, tags, episodes, crumbs, null)
+    }
+
+    /**
+     * Página de categoria de uma série (/browse-<serie>-videos-1-date.html, vinda da busca).
+     * 1) Se tiver o item "Lista de Episódios", usa essa página (formato que já é lido).
+     * 2) Senão, cada item da categoria vira um episódio (temporada/número pelo título),
+     *    percorrendo as páginas da categoria.
+     */
+    private suspend fun loadBrowse(url: String): LoadResponse {
+        val pageUrl = url.rehostIfOurs(mainUrl)
+        val first = getDoc(url)
+        val host = currentHost()
+
+        data class Item(val title: String, val href: String, val poster: String?)
+        fun items(doc: Document): List<Item> = doc.select(Sel.LIST_ITEM).mapNotNull { li ->
+            val a = li.selectFirst(Sel.ITEM_LINK) ?: return@mapNotNull null
+            val href = fixUrl(a.attr("href")).rehostIfOurs(mainUrl)
+            val t = li.selectFirst(Sel.ITEM_TITLE)?.text()?.trim()?.takeIf { it.isNotEmpty() }
+                ?: a.attr("title").trim()
+            val itemHost = runCatching { URI(href).host.normHost() }.getOrNull()
+            if (t.isEmpty() || (host.isNotEmpty() && itemHost != null && itemHost != host && !itemHost.endsWith(".$host"))) null
+            else Item(t, href, fixUrlNull(li.selectFirst(Sel.ITEM_POSTER)?.imageUrl()))
+        }
+
+        val firstItems = items(first)
+        firstItems.firstOrNull { LIST_SUFFIX_REGEX.containsMatchIn(it.title) || "lista-de-episodios" in it.href }
+            ?.let { lista ->
+                log("load", "categoria $pageUrl -> lista de episódios ${lista.href}")
+                lista.poster?.let { p -> posterCache.putIfAbsent(lista.href.pathKey(), p) }
+                return load(lista.href)
+            }
+
+        // Sem "Lista de Episódios": monta pelos itens da categoria
+        val all = ArrayList(firstItems)
+        val path = runCatching { URI(pageUrl).rawPath }.getOrNull().orEmpty()
+        if (PAGE_REGEX.containsMatchIn(path)) {
+            var page = 2
+            while (page <= BROWSE_MAX_PAGES) {
+                val more = safe("categoria p$page") { items(getDoc(pageUrl(base(), path, page))) }.orEmpty()
+                    .filter { m -> all.none { it.href == m.href } }
+                if (more.isEmpty()) break
+                all += more
+                page++
+            }
+        }
+        log("load", "categoria $pageUrl itens=${all.size}")
+
+        val counters = mutableMapOf<Int, Int>()
+        val grouped = LinkedHashMap<Pair<Int, Int>, Pair<String, LinkedHashSet<String>>>()
+        // A categoria lista do mais novo para o mais antigo: inverte para numerar em ordem
+        for (it in all.asReversed()) {
+            val season = SEASON_REGEX.find(it.title)?.let { m -> m.groupValues[1].ifEmpty { m.groupValues[2] }.toIntOrNull() }
+                ?: SE_REGEX.find(it.title)?.let { m -> m.groupValues[1].ifEmpty { m.groupValues[2] }.toIntOrNull() }
+                ?: 1
+            val num = EP_REGEX.find(it.title)?.groupValues?.get(1)?.toIntOrNull()
+                ?: SE_REGEX.find(it.title)?.groupValues?.get(3)?.toIntOrNull()
+                ?: ((counters[season] ?: 0) + 1)
+            counters[season] = maxOf(counters[season] ?: 0, num)
+            val name = EP_REGEX.find(it.title)?.let { m -> it.title.substring(m.range.last + 1) }
+                ?.trim()?.trim('-', '–', '|', ' ')?.replace(EP_SUFFIX_REGEX, "")?.takeIf { n -> n.isNotBlank() }
+                ?: it.title
+            grouped.getOrPut(season to num) { name to LinkedHashSet() }.second += it.href
+        }
+        val episodes = grouped.entries
+            .sortedWith(compareBy({ it.key.first }, { it.key.second }))
+            .map { (k, v) ->
+                newEpisode(v.second.joinToString(DATA_SEP)) {
+                    this.name = v.first; this.season = k.first; this.episode = k.second
+                }
+            }
+
+        val rawTitle = first.selectFirst(Sel.PAGE_TITLE)?.text()?.trim()?.takeIf { it.isNotEmpty() }
+            ?: first.metaContent("og:title") ?: Catalog.titleFor(path) ?: "Série"
+        val title = rawTitle.replace(LIST_SUFFIX_REGEX, "").trim()
+        val poster = posterCache[url.pathKey()] ?: first.metaContent("og:image")?.takeUnless { GENERIC_IMG_REGEX.containsMatchIn(it) }
+            ?: all.firstOrNull()?.poster
+        val plot = first.metaContent("og:description") ?: first.metaContent("description")
+        val crumbs = (Catalog.sectionFor(path) ?: "") + " " + title.lowercase()
+
+        if (episodes.isEmpty()) throw ErrorLoadingException("Nenhum episódio encontrado")
+        return buildResponse(title, pageUrl, poster, plot, null, emptyList(), episodes, crumbs.lowercase(), TvType.TvSeries)
+    }
+
+    /** Monta a resposta (filme ou série) aplicando o TMDB. Comum à página de vídeo e à de categoria. */
+    private suspend fun buildResponse(
+        title: String,
+        pageUrl: String,
+        poster: String?,
+        plot: String?,
+        year: Int?,
+        tags: List<String>,
+        episodes: List<Episode>,
+        crumbs: String,
+        forceType: TvType?,
+    ): LoadResponse {
         log("load", "episódios=${episodes.size}")
 
         // ---- TMDB: poster, fundo, sinopse, nota, duração, gêneros, elenco, trailer e dados por episódio
@@ -350,12 +495,11 @@ class HtmlSiteProvider : MainAPI() {
         }
 
         return if (isSeries) {
-            val crumbs = (doc.select(Sel.BREADCRUMB).map { it.text() } + tags).joinToString(" ").lowercase()
             val type = when {
                 "dorama" in crumbs -> TvType.AsianDrama
                 "desenho" in crumbs -> TvType.Cartoon
                 "anime" in crumbs -> TvType.Anime
-                else -> typeFromUrl(pageUrl, TvType.TvSeries)
+                else -> forceType ?: typeFromUrl(pageUrl, TvType.TvSeries)
             }
             newTvSeriesLoadResponse(title, pageUrl, type, episodes) {
                 posterUrl = finalPoster; this.plot = finalPlot; this.year = finalYear; this.tags = finalTags
@@ -977,6 +1121,12 @@ class HtmlSiteProvider : MainAPI() {
         val LINK_IP_REGEX = Regex("""[?&]ip=([0-9.]+)""")
         val LINK_IP6_REGEX = Regex("""[?&]ipv6=([0-9a-fA-F:]+)""")
         val TRACE_IP_REGEX = Regex("""(?m)^ip=(\S+)""")
+        const val SEARCH_LIMIT = 80
+        /** Quantos resultados da busca recebem pôster do TMDB, e o prazo total para isso. */
+        const val SEARCH_POSTER_COUNT = 20
+        const val SEARCH_POSTER_TIMEOUT_MS = 3_000L
+        const val BROWSE_MAX_PAGES = 15
+        val BROWSE_URL_REGEX = Regex("""/browse-[^/]+-videos(?:-\d+-[a-z]+)?\.html""")
         /** Texto que é lista de episódios, não sinopse. */
         val LIST_PLOT_REGEX = Regex("""(?i)assistir|(?:epis[oó]dio\s*\d+[\s\S]*){2}""")
         val GENERIC_EP_NAME_REGEX = Regex("""(?i)^\s*epis[oó]dio\s*\d+\s*$""")
@@ -1636,6 +1786,13 @@ object Tmdb {
             .replace(Regex("""\s+"""), " ")
             .trim()
 
+    /** Minúsculas, sem acento, só letras/números separados por um espaço ("Mortos-Vivos" = "mortos vivos"). */
+    fun normalizeWords(s: String): String =
+        java.text.Normalizer.normalize(s.lowercase(), java.text.Normalizer.Form.NFD)
+            .replace(Regex("""\p{M}+"""), "")
+            .replace(Regex("""[^a-z0-9]+"""), " ")
+            .trim()
+
     fun normalize(s: String): String =
         java.text.Normalizer.normalize(s.lowercase(), java.text.Normalizer.Form.NFD)
             .replace(Regex("""\p{M}+"""), "")
@@ -1695,8 +1852,31 @@ object Tmdb {
         return meta
     }
 
+    private val posterCache = ConcurrentHashMap<String, String>()
+    private val posterMiss = ConcurrentHashMap<String, Long>()
+
+    /**
+     * Só o pôster (para a busca): 1 consulta de busca no TMDB, sem detalhes.
+     * Cache de acerto na sessão; erro/sem resultado não é repetido por 30 min.
+     */
+    suspend fun posterFor(siteTitle: String, siteYear: Int?, isSeries: Boolean, until: Long): String? {
+        if (TMDB_API_KEY.isBlank()) return null
+        val query = cleanTitle(siteTitle).ifEmpty { return null }
+        val key = "${if (isSeries) "tv" else "movie"}|${normalize(query)}|$siteYear"
+        posterCache[key]?.let { return it }
+        posterMiss[key]?.let { if (System.currentTimeMillis() - it < 30 * 60_000L) return null }
+        val best = searchBest(query, siteYear, isSeries, until)
+        val poster = img(best?.str("poster_path"), "w342")
+        if (poster != null) posterCache[key] = poster
+        else if (System.currentTimeMillis() < until) posterMiss[key] = System.currentTimeMillis()  // não marca se foi só falta de tempo
+        return poster
+    }
+
     /** Busca e escolhe o resultado mais parecido (nome igual pesa mais; ano confirma). */
-    private suspend fun search(query: String, year: Int?, isSeries: Boolean, until: Long): Int? {
+    private suspend fun search(query: String, year: Int?, isSeries: Boolean, until: Long): Int? =
+        searchBest(query, year, isSeries, until)?.optInt("id")?.takeIf { it > 0 }
+
+    private suspend fun searchBest(query: String, year: Int?, isSeries: Boolean, until: Long): JSONObject? {
         val path = if (isSeries) "/search/tv" else "/search/movie"
         val yearParam = if (isSeries) "first_air_date_year" else "primary_release_year"
         var results = year?.let { get(path, mapOf("query" to query, yearParam to it.toString()), until)?.optJSONArray("results") }
@@ -1704,7 +1884,7 @@ object Tmdb {
         if (results == null || results.length() == 0) return null
 
         val q = normalize(query)
-        var best: Pair<Int, Double>? = null
+        var best: Pair<JSONObject, Double>? = null
         for (i in 0 until minOf(results.length(), 10)) {
             val r = results.optJSONObject(i) ?: continue
             val names = listOfNotNull(
@@ -1721,9 +1901,9 @@ object Tmdb {
                 0 -> 5.0; 1 -> 2.0; else -> -3.0
             }
             score -= i * 0.1
-            if (best == null || score > best.second) best = r.optInt("id") to score
+            if (best == null || score > best.second) best = r to score
         }
-        return best?.first?.takeIf { it > 0 }
+        return best?.first
     }
 
     private fun parseCommon(d: JSONObject, isSeries: Boolean): TmdbMeta {
@@ -1864,4 +2044,79 @@ object RcWebViewProxy {
         latch.await(3, TimeUnit.SECONDS)
         Log.d(TAG, "[webproxy] desligado")
     }
+}
+
+/**
+ * Catálogo do site (o mesmo que a busca do navegador usa):
+ *  /final_mapafilmes.txt -> filmes (link para a página do vídeo)
+ *  /final_mapa.txt       -> séries, desenhos, animes, novelas (link para a categoria da série)
+ * Linhas no formato: "Título (Dublado) - 2020 - 1080p - <a href="/caminho.html">Assistir</a><br />"
+ * Seções: <span style="font-size: x-large;"><b>Séries</b></span>
+ */
+object Catalog {
+    private const val TAG = "RedeCanais"
+    private const val TTL_MS = 6 * 60 * 60 * 1000L
+    private val FILES = listOf("/final_mapafilmes.txt", "/final_mapa.txt")
+    private val SECTION = Regex("""font-size:\s*x-large;?"?>\s*<b>(.*?)</b>""", RegexOption.IGNORE_CASE)
+    private val LINE = Regex("""^(.*?)<a\s+href="([^"]+)""", RegexOption.IGNORE_CASE)
+    private val TAGS = Regex("""<[^>]+>""")
+
+    data class Entry(val title: String, val path: String, val type: TvType, val section: String, val norm: String) {
+        /** Sem espaços: "(Des)encanto" -> "desencanto", "Spider-Man" -> "spiderman". */
+        val compact: String = norm.replace(" ", "")
+    }
+
+    @Volatile private var cached: List<Entry> = emptyList()
+    @Volatile private var loadedAt = 0L
+    private val byPath = ConcurrentHashMap<String, Entry>()
+
+    suspend fun get(base: String, headers: Map<String, String>): List<Entry> {
+        if (cached.isNotEmpty() && System.currentTimeMillis() - loadedAt < TTL_MS) return cached
+        val parts = FILES.amap { f ->
+            try {
+                val res = app.get(base.trimEnd('/') + f, headers = headers, timeout = 40L)
+                if (res.isSuccessful) parse(res.text) else { Log.w(TAG, "[catálogo] HTTP ${res.code} em $f"); emptyList() }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "[catálogo] $f falhou: ${e.javaClass.simpleName}: ${e.message}")
+                emptyList()
+            }
+        }
+        val all = parts.flatten()
+        if (all.isNotEmpty()) {
+            cached = all
+            loadedAt = System.currentTimeMillis()
+            byPath.clear()
+            all.forEach { byPath.putIfAbsent(it.path, it) }
+        }
+        Log.d(TAG, "[catálogo] ${all.size} títulos")
+        return all.ifEmpty { cached }
+    }
+
+    fun parse(text: String): List<Entry> {
+        val out = ArrayList<Entry>()
+        var section = ""
+        for (line in text.lineSequence()) {
+            SECTION.find(line)?.let { section = TAGS.replace(it.groupValues[1], "").trim(); return@let }
+            if (SECTION.containsMatchIn(line)) continue
+            val m = LINE.find(line) ?: continue
+            val title = TAGS.replace(m.groupValues[1], "")
+                .replace("&amp;", "&").replace("&nbsp;", " ")
+                .replace(Regex("""\s+"""), " ").trim().trimEnd('-', ' ').trim()
+            val path = m.groupValues[2].trim().substringBefore(' ')
+            if (title.isEmpty() || path.isEmpty()) continue
+            val type = when {
+                section.contains("filme", true) -> TvType.Movie
+                section.contains("anime", true) -> TvType.Anime
+                section.contains("desenho", true) -> TvType.Cartoon
+                else -> if ("/browse-" in path || "lista-de-episodios" in path) TvType.TvSeries else TvType.Movie
+            }
+            out += Entry(title, path, type, section, Tmdb.normalizeWords(title))
+        }
+        return out
+    }
+
+    fun titleFor(path: String): String? = byPath[path]?.title
+    fun sectionFor(path: String): String? = byPath[path]?.section
 }
