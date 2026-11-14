@@ -40,6 +40,18 @@ import okhttp3.Dns
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.net.Inet4Address
+import java.net.InetSocketAddress
+import java.net.Socket
+import java.net.SocketAddress
+import java.security.KeyStore
+import javax.net.ssl.HandshakeCompletedListener
+import javax.net.ssl.SNIHostName
+import javax.net.ssl.SSLParameters
+import javax.net.ssl.SSLSession
+import javax.net.ssl.SSLSocket
+import javax.net.ssl.SSLSocketFactory
+import javax.net.ssl.TrustManagerFactory
+import javax.net.ssl.X509TrustManager
 import java.net.InetAddress
 import java.net.UnknownHostException
 import java.util.concurrent.TimeUnit
@@ -49,7 +61,7 @@ import java.util.concurrent.TimeUnit
  */
 class HtmlSiteProvider : MainAPI() {
 
-    override var name = "Rede Canais V17"
+    override var name = "Rede Canais V18"
     override var mainUrl = "https://redecanais.by"
     override var lang = "pt-br"
     override val hasMainPage = true
@@ -961,8 +973,24 @@ object RcDns : Dns {
         val client = app.baseClient
         if (client.dns is RcDns) return
         fallback = client.dns
-        app.baseClient = client.newBuilder().dns(this).build()
-        Log.d(TAG, "[dns] RcDns instalado (anterior: ${fallback.javaClass.simpleName})")
+        val builder = client.newBuilder().dns(this)
+        // TLS: hosts com "_" quebram o SNIHostName do Java; embrulha só esses sockets.
+        runCatching {
+            val tm = client.x509TrustManager ?: defaultTrustManager()
+            builder.sslSocketFactory(SniSafeSocketFactory(client.sslSocketFactory), tm)
+            sniPatched = true
+        }.onFailure { Log.w(TAG, "[tls] não deu para instalar SniSafeSocketFactory: $it") }
+        app.baseClient = builder.build()
+        Log.d(TAG, "[dns] RcDns instalado (anterior: ${fallback.javaClass.simpleName}) sni=$sniPatched")
+    }
+
+    @Volatile var sniPatched = false
+        private set
+
+    private fun defaultTrustManager(): X509TrustManager {
+        val tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm())
+        tmf.init(null as KeyStore?)
+        return tmf.trustManagers.filterIsInstance<X509TrustManager>().first()
     }
 
     /** Hosts do vídeo: o link é assinado para o IPv4 do cliente (ip=...&ipv6=), então só IPv4. */
@@ -1030,6 +1058,113 @@ object RcDns : Dns {
         val installed = app.baseClient.dns is RcDns
         val hosts = lastResult.entries.filter { "null-null" in it.key || "neosoro" in it.key }
             .joinToString(", ") { (h, r) -> (if (h.length > 24) "…" + h.takeLast(20) else h) + "=" + r }
-        return "instalado=$installed ${hosts.ifEmpty { "(nenhuma consulta)" }}"
+        return "instalado=$installed sni=$sniPatched ${hosts.ifEmpty { "(nenhuma consulta)" }}"
     }
+}
+
+/**
+ * O OkHttp no Android chama SSLSocket.getSSLParameters(); o Conscrypt monta ali um
+ * SNIHostName(host), que lança IllegalArgumentException para hosts com "_" ou hífen
+ * no início do rótulo (ex.: "-_kerberos-__tcp-...null-null.shop"). O Chrome não tem essa
+ * restrição. Para esses hosts o socket é embrulhado: o SNI continua sendo enviado pelo
+ * Conscrypt (ele recebe o host em createSocket) e a verificação do certificado continua.
+ */
+class SniSafeSocketFactory(private val delegate: SSLSocketFactory) : SSLSocketFactory() {
+    override fun getDefaultCipherSuites(): Array<String> = delegate.defaultCipherSuites
+    override fun getSupportedCipherSuites(): Array<String> = delegate.supportedCipherSuites
+
+    private fun wrap(socket: Socket, host: String?): Socket {
+        if (socket !is SSLSocket || host == null) return socket
+        val sniOk = runCatching { SNIHostName(host) }.isSuccess
+        return if (sniOk) socket else SniSafeSSLSocket(socket)
+    }
+
+    override fun createSocket(s: Socket, host: String, port: Int, autoClose: Boolean): Socket =
+        wrap(delegate.createSocket(s, host, port, autoClose), host)
+    override fun createSocket(host: String, port: Int): Socket = wrap(delegate.createSocket(host, port), host)
+    override fun createSocket(host: String, port: Int, localHost: java.net.InetAddress, localPort: Int): Socket =
+        wrap(delegate.createSocket(host, port, localHost, localPort), host)
+    override fun createSocket(host: java.net.InetAddress, port: Int): Socket = delegate.createSocket(host, port)
+    override fun createSocket(address: java.net.InetAddress, port: Int, localAddress: java.net.InetAddress, localPort: Int): Socket =
+        delegate.createSocket(address, port, localAddress, localPort)
+    override fun createSocket(): Socket = delegate.createSocket()
+}
+
+/** SSLSocket que repassa tudo ao socket real, exceto get/setSSLParameters, que ficam tolerantes. */
+class SniSafeSSLSocket(private val d: SSLSocket) : SSLSocket() {
+    override fun getSSLParameters(): SSLParameters = try {
+        d.sslParameters
+    } catch (e: RuntimeException) {
+        SSLParameters(d.enabledCipherSuites, d.enabledProtocols)
+    }
+
+    override fun setSSLParameters(params: SSLParameters) {
+        try {
+            d.sslParameters = params
+        } catch (e: RuntimeException) {
+            params.cipherSuites?.let { d.enabledCipherSuites = it }
+            params.protocols?.let { d.enabledProtocols = it }
+        }
+    }
+
+    override fun getSupportedCipherSuites(): Array<String> = d.supportedCipherSuites
+    override fun getEnabledCipherSuites(): Array<String> = d.enabledCipherSuites
+    override fun setEnabledCipherSuites(suites: Array<String>) { d.enabledCipherSuites = suites }
+    override fun getSupportedProtocols(): Array<String> = d.supportedProtocols
+    override fun getEnabledProtocols(): Array<String> = d.enabledProtocols
+    override fun setEnabledProtocols(protocols: Array<String>) { d.enabledProtocols = protocols }
+    override fun getSession(): SSLSession = d.session
+    override fun getHandshakeSession(): SSLSession? = d.handshakeSession
+    override fun addHandshakeCompletedListener(l: HandshakeCompletedListener) = d.addHandshakeCompletedListener(l)
+    override fun removeHandshakeCompletedListener(l: HandshakeCompletedListener) = d.removeHandshakeCompletedListener(l)
+    override fun startHandshake() = d.startHandshake()
+    override fun setUseClientMode(mode: Boolean) { d.useClientMode = mode }
+    override fun getUseClientMode(): Boolean = d.useClientMode
+    override fun setNeedClientAuth(need: Boolean) { d.needClientAuth = need }
+    override fun getNeedClientAuth(): Boolean = d.needClientAuth
+    override fun setWantClientAuth(want: Boolean) { d.wantClientAuth = want }
+    override fun getWantClientAuth(): Boolean = d.wantClientAuth
+    override fun setEnableSessionCreation(flag: Boolean) { d.enableSessionCreation = flag }
+    override fun getEnableSessionCreation(): Boolean = d.enableSessionCreation
+
+    override fun connect(endpoint: SocketAddress?) = d.connect(endpoint)
+    override fun connect(endpoint: SocketAddress?, timeout: Int) = d.connect(endpoint, timeout)
+    override fun bind(bindpoint: SocketAddress?) = d.bind(bindpoint)
+    override fun getInetAddress(): java.net.InetAddress? = d.inetAddress
+    override fun getLocalAddress(): java.net.InetAddress? = d.localAddress
+    override fun getPort(): Int = d.port
+    override fun getLocalPort(): Int = d.localPort
+    override fun getRemoteSocketAddress(): SocketAddress? = d.remoteSocketAddress
+    override fun getLocalSocketAddress(): SocketAddress? = d.localSocketAddress
+    override fun setTcpNoDelay(on: Boolean) { d.tcpNoDelay = on }
+    override fun getTcpNoDelay(): Boolean = d.tcpNoDelay
+    override fun setSoLinger(on: Boolean, linger: Int) = d.setSoLinger(on, linger)
+    override fun getSoLinger(): Int = d.soLinger
+    override fun setSoTimeout(timeout: Int) { d.soTimeout = timeout }
+    override fun getSoTimeout(): Int = d.soTimeout
+    override fun setSendBufferSize(size: Int) { d.sendBufferSize = size }
+    override fun getSendBufferSize(): Int = d.sendBufferSize
+    override fun setReceiveBufferSize(size: Int) { d.receiveBufferSize = size }
+    override fun getReceiveBufferSize(): Int = d.receiveBufferSize
+    override fun setKeepAlive(on: Boolean) { d.keepAlive = on }
+    override fun getKeepAlive(): Boolean = d.keepAlive
+    override fun setTrafficClass(tc: Int) { d.trafficClass = tc }
+    override fun getTrafficClass(): Int = d.trafficClass
+    override fun setReuseAddress(on: Boolean) { d.reuseAddress = on }
+    override fun getReuseAddress(): Boolean = d.reuseAddress
+    override fun setOOBInline(on: Boolean) { d.oobInline = on }
+    override fun getOOBInline(): Boolean = d.oobInline
+    override fun sendUrgentData(data: Int) = d.sendUrgentData(data)
+    override fun getInputStream(): java.io.InputStream = d.inputStream
+    override fun getOutputStream(): java.io.OutputStream = d.outputStream
+    override fun close() = d.close()
+    override fun shutdownInput() = d.shutdownInput()
+    override fun shutdownOutput() = d.shutdownOutput()
+    override fun isConnected(): Boolean = d.isConnected
+    override fun isBound(): Boolean = d.isBound
+    override fun isClosed(): Boolean = d.isClosed
+    override fun isInputShutdown(): Boolean = d.isInputShutdown
+    override fun isOutputShutdown(): Boolean = d.isOutputShutdown
+    override fun getChannel(): java.nio.channels.SocketChannel? = d.channel
+    override fun toString(): String = "SniSafeSSLSocket($d)"
 }
