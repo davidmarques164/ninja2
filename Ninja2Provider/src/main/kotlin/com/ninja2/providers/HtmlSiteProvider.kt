@@ -1,6 +1,7 @@
 package com.ninja2.providers
 
 import android.util.Base64
+import android.util.Log
 import com.lagradost.cloudstream3.Episode
 import com.lagradost.cloudstream3.ErrorLoadingException
 import com.lagradost.cloudstream3.HomePageResponse
@@ -15,6 +16,8 @@ import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.fixUrl
 import com.lagradost.cloudstream3.fixUrlNull
 import com.lagradost.cloudstream3.mainPageOf
+import com.lagradost.cloudstream3.network.CloudflareKiller
+import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.newEpisode
 import com.lagradost.cloudstream3.newHomePageResponse
 import com.lagradost.cloudstream3.newMovieLoadResponse
@@ -22,33 +25,48 @@ import com.lagradost.cloudstream3.newMovieSearchResponse
 import com.lagradost.cloudstream3.newTvSeriesLoadResponse
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
-import com.lagradost.cloudstream3.utils.Qualities
+import com.lagradost.cloudstream3.utils.getQualityFromName
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URI
+import java.net.URLDecoder
 import java.net.URLEncoder
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.cancellation.CancellationException
 
+/**
+ * Logs: adb logcat -s RedeCanais
+ */
 class HtmlSiteProvider : MainAPI() {
 
-    override var name = "Rede Canais V10"
+    override var name = "Rede Canais V11"
     override var mainUrl = "https://redecanais.by"
     override var lang = "pt-br"
     override val hasMainPage = true
     override val hasQuickSearch = false
-    override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)
+    override val supportedTypes = setOf(
+        TvType.Movie, TvType.TvSeries, TvType.Anime, TvType.Cartoon, TvType.AsianDrama
+    )
 
     private val domainKey = "redecanais"
 
-    private val headers = mapOf(
-        "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+    /** Headers para hosts de terceiros (players/CDNs). */
+    private val baseHeaders = mapOf(
+        "User-Agent" to USER_AGENT,
         "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language" to "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-        "X-Requested-With" to "RC-Site-Requests",
     )
+
+    /** Headers só para o próprio site. */
+    private val siteHeaders = baseHeaders + ("X-Requested-With" to "RC-Site-Requests")
+
+    private val cfKiller by lazy { CloudflareKiller() }
+
+    /** Poster visto na listagem/busca, indexado pelo path (independe do domínio). */
+    private val posterCache = ConcurrentHashMap<String, String>()
 
     override val mainPage = mainPageOf(
         "/browse-filmes-videos-1-date.html" to "Filmes",
@@ -68,47 +86,75 @@ class HtmlSiteProvider : MainAPI() {
         "/browse-mgmplus-videos-1-date.html" to "Lionsgate+"
     )
 
-    private fun pageUrl(base: String, path: String, page: Int): String =
-        base + path.replace(PAGE_REGEX, "-$page-date.html")
-
-    private fun searchUrl(base: String, query: String): String =
-        "$base/search.php?keywords=" + URLEncoder.encode(query, "UTF-8")
-
     private object Sel {
         const val LIST_ITEM = "ul.pm-ul-carousel-videos li, ul.pm-ul-browse-videos li"
-        const val ITEM_LINK = "a[href]"
-        const val ITEM_TITLE = "h3 a, .caption h3 a, .title"
-        const val ITEM_POSTER = "img"
+        /**
+         * O 1º <a> de cada item é o botão "Watch Later" (href="#modal-login-form").
+         * Pegar "a[href]" fazia todos os itens apontarem para a home.
+         */
+        const val ITEM_LINK = ".caption h3 a[href], h3 a[href], a[href\$=.html]:not(.pm-watch-later-add)"
+        const val ITEM_TITLE = ".caption h3 a, h3 a, .title"
+        const val ITEM_POSTER = "img[data-echo], img"
 
-        const val PAGE_TITLE = "h1"
-        const val PAGE_POSTER = "div.poster img, .pm-video-watch-featured img, .pm-video-thumb img"
-        const val PAGE_PLOT = "div.sinopse, .pm-video-description, .description p, #content-main .description"
+        /** Bloco principal (o <h1> fica fora dele, por isso título/sinopse usam o doc). */
+        const val MAIN = ".pm-video-watch-main, #content-main, main, #content"
+        const val PAGE_TITLE = "h1[itemprop=name], h1"
+        const val PAGE_POSTER = "meta[itemprop=thumbnailUrl], link[rel=image_src]"
+        const val PAGE_PLOT = "[itemprop=description]"
         const val PAGE_YEAR = "span.ano, .year"
-        const val PAGE_TAGS = ".entry-tags a, a[rel=tag], .pm-video-tags a"
+        const val PAGE_TAGS = ".entry-tags a, a[rel=tag], .pm-video-tags a, a[href*=/tags/]"
         const val BREADCRUMB = ".breadcrumb a, ul.breadcrumb li a"
+        const val PAGER = ".pagination, ul.pagination, .pm-pagination"
 
         const val EPISODE_LIST_LINK = "ul.episodios li a, .episodes a"
-        const val EPISODE_DESC_LINK = ".pm-video-description a[href], .pm-category-description a[href], #content-main .description a[href]"
+        const val EPISODE_DESC_LINK = "[itemprop=description] a[href], .pm-video-description a[href], .pm-category-description a[href]"
         const val SEASON_HEADER = "strong, b, h2, h3, h4, span"
 
         const val PLAYER_CONTAINER = "#player, .player, .pm-video-watch-main, .embed-responsive, #video-player"
         const val PLAYER = "iframe[src], iframe[data-src], [data-player], [data-url]"
     }
 
+    // ---------------------------------------------------------------- util
+
+    private fun log(step: String, msg: String) {
+        Log.d(TAG, "[$step] $msg")
+    }
+
+    /** runCatching que não engole CancellationException. */
+    private inline fun <T> safe(step: String, block: () -> T): T? = try {
+        block()
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        Log.w(TAG, "[$step] ${e.javaClass.simpleName}: ${e.message}")
+        null
+    }
+
+    private fun pageUrl(base: String, path: String, page: Int): String =
+        base + path.replace(PAGE_REGEX, "-$page-date.html")
+
+    private fun searchUrl(base: String, query: String): String =
+        "$base/search.php?keywords=" + URLEncoder.encode(query, "UTF-8")
+
     private fun typeFromUrl(href: String, hint: TvType? = null): TvType = when {
         "/series/" in href || "/browse-series-" in href || "lista-de-episodios" in href -> TvType.TvSeries
         "/animes/" in href || "/browse-animes-" in href -> TvType.Anime
-        "/desenhos/" in href || "/browse-desenhos-" in href -> TvType.Anime
+        "/desenhos/" in href || "/browse-desenhos-" in href -> TvType.Cartoon
+        "/doramas/" in href || "/browse-doramas-" in href -> TvType.AsianDrama
         hint != null -> hint
         else -> TvType.Movie
     }
 
     private fun typeFromCategory(path: String): TvType? = when {
-        "/browse-series-" in path || "/browse-novelas-" in path || "/browse-doramas-" in path -> TvType.TvSeries
-        "/browse-animes-" in path || "/browse-desenhos-" in path -> TvType.Anime
+        "/browse-series-" in path || "/browse-novelas-" in path -> TvType.TvSeries
+        "/browse-doramas-" in path -> TvType.AsianDrama
+        "/browse-animes-" in path -> TvType.Anime
+        "/browse-desenhos-" in path -> TvType.Cartoon
         "/browse-filmes-" in path -> TvType.Movie
         else -> null
     }
+
+    // ---------------------------------------------------------------- rede
 
     private suspend fun base(): String {
         mainUrl = DomainManager.current(domainKey, mainUrl)
@@ -120,163 +166,168 @@ class HtmlSiteProvider : MainAPI() {
         val target = url.rehostIfOurs(current)
         fetch(target, referer)?.let { return it }
 
+        log("getDoc", "falhou em $current, invalidando domínio")
         DomainManager.invalidate(domainKey)
         val newBase = base()
         if (newBase == current) throw ErrorLoadingException("Falha ao carregar $target")
+        log("getDoc", "novo domínio: $newBase")
         return fetch(target.rehostIfOurs(newBase), referer)
             ?: throw ErrorLoadingException("Falha ao carregar $target")
     }
 
-    private suspend fun fetch(url: String, referer: String?): Document? = try {
-        val res = app.get(url, headers = headers, referer = referer)
-        when {
-            res.isSuccessful -> res.document
-            res.code == 404 -> throw ErrorLoadingException("Página não encontrada (404)")
-            else -> null
+    /**
+     * null  -> falha de rede ou HTTP inesperado (justifica trocar de domínio)
+     * throw -> 404 ou bloqueio (403/429/503): trocar de domínio não resolve
+     */
+    private suspend fun fetch(url: String, referer: String?): Document? {
+        val res = safe("fetch") { app.get(url, headers = siteHeaders, referer = referer) }
+            ?: run { log("fetch", "falha de rede: $url"); return null }
+
+        if (res.isSuccessful) return res.document
+        if (res.code == 404) throw ErrorLoadingException("Página não encontrada (404)")
+
+        if (res.code in BLOCK_CODES) {
+            log("fetch", "HTTP ${res.code} em $url, tentando CloudflareKiller")
+            val retry = safe("fetch-cf") {
+                app.get(url, headers = siteHeaders, referer = referer, interceptor = cfKiller)
+            }
+            if (retry?.isSuccessful == true) return retry.document
+            throw ErrorLoadingException("Acesso bloqueado (HTTP ${res.code})")
         }
-    } catch (e: CancellationException) {
-        throw e
-    } catch (e: ErrorLoadingException) {
-        throw e
-    } catch (e: Exception) {
-        null
+
+        log("fetch", "HTTP ${res.code} em $url")
+        return null
     }
 
-    private fun String.rehostIfOurs(base: String): String = runCatching {
-        val u = URI(this)
-        val host = u.host ?: return this
-        if (!host.contains(domainKey) || host.normHost() == URI(base).host.normHost()) return this
-        base.trimEnd('/') + (u.rawPath ?: "") + (u.rawQuery?.let { "?$it" } ?: "")
-    }.getOrDefault(this)
+    private fun headersFor(url: String) = if (url.isSameSite()) siteHeaders else baseHeaders
+
+    // ---------------------------------------------------------------- listagem / busca
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val doc = getDoc(pageUrl(base(), request.data, page))
         val host = currentHost()
         val hint = typeFromCategory(request.data)
-        val items = doc.select(Sel.LIST_ITEM).mapNotNull { it.toSearchResult(host, hint) }
-        return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
+        val items = doc.select(Sel.LIST_ITEM)
+            .mapNotNull { it.toSearchResult(host, hint) }
+            .distinctBy { it.url }
+
+        val nextMarker = "-${page + 1}-date.html"
+        val hasPager = doc.selectFirst(Sel.PAGER) != null
+        val hasNext = items.isNotEmpty() &&
+            (!hasPager || doc.select("a[href]").any { nextMarker in it.attr("href") })
+
+        return newHomePageResponse(request.name, items, hasNext = hasNext)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
         val doc = getDoc(searchUrl(base(), query))
         val host = currentHost()
-        return doc.select(Sel.LIST_ITEM).mapNotNull { it.toSearchResult(host, null) }
-    }
-
-    override suspend fun load(url: String): LoadResponse {
-        val doc = getDoc(url)
-        val pageUrl = url.rehostIfOurs(mainUrl)
-
-        val title = (doc.selectFirst(Sel.PAGE_TITLE)?.text()
-            ?: doc.selectFirst("meta[property=og:title]")?.attr("content"))
-            ?.trim()?.takeIf { it.isNotEmpty() }
-            ?: throw ErrorLoadingException("Título não encontrado")
-
-        val poster = fixUrlNull(
-            doc.selectFirst(Sel.PAGE_POSTER)?.imageUrl()
-                ?: doc.selectFirst("meta[property=og:image]")?.attr("content")?.takeIf { it.isNotBlank() }
-        )
-        val plot = (doc.selectFirst(Sel.PAGE_PLOT)?.text()
-            ?: doc.selectFirst("meta[name=description], meta[property=og:description]")?.attr("content"))
-            ?.trim()?.takeIf { it.isNotEmpty() }
-        val year = (doc.selectFirst(Sel.PAGE_YEAR)?.text() ?: title)
-            .let { YEAR_REGEX.find(it)?.value?.toIntOrNull() }
-        val tags = doc.select(Sel.PAGE_TAGS).map { it.text().trim() }.filter { it.isNotEmpty() }
-
-        val episodes = parseEpisodes(doc)
-        return if (episodes.isNotEmpty()) {
-            val crumbs = (doc.select(Sel.BREADCRUMB).map { it.text() } + tags).joinToString(" ").lowercase()
-            val type = if ("anime" in crumbs || "desenho" in crumbs) TvType.Anime else TvType.TvSeries
-            newTvSeriesLoadResponse(title, pageUrl, type, episodes) {
-                posterUrl = poster; this.plot = plot; this.year = year; this.tags = tags
-            }
-        } else {
-            newMovieLoadResponse(title, pageUrl, TvType.Movie, pageUrl) {
-                posterUrl = poster; this.plot = plot; this.year = year; this.tags = tags
-            }
-        }
-    }
-
-    override suspend fun loadLinks(
-        data: String,
-        isCasting: Boolean,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit,
-    ): Boolean {
-        val doc = getDoc(data)
-        val pageUrl = data.rehostIfOurs(mainUrl)
-
-        val scope: Element = doc.selectFirst(Sel.PLAYER_CONTAINER) ?: doc
-        val candidates = scope.select(Sel.PLAYER).ifEmpty { doc.select(Sel.PLAYER) }
-
-        val playerUrls = candidates
-            .filter { it.tagName() != "img" }
-            .mapNotNull { it.playerUrl() }
-            .map { it.resolveAgainst(pageUrl) }
-            .distinct()
-
-        val found = AtomicBoolean(false)
-
-        playerUrls.amap { url ->
-            val vid = VID_REGEX.find(url)?.groupValues?.get(1)
-
-            val res = runCatching { app.get(url, headers = headers, referer = pageUrl) }.getOrNull()
-            val html = res?.text ?: ""
-            val resolvedUrl = runCatching { resolveRedirects(url, referer = pageUrl) }.getOrDefault(url)
-
-            val directVideoMatches = DIRECT_VIDEO_URL_REGEX.findAll(html).map { it.value }.toList()
-            val linksToTest = listOfNotNull(resolvedUrl) + directVideoMatches + listOfNotNull(vid?.let { "https://neosoro.gq/V/RCFServer3/ondemand/$it.mp4" })
-
-            for (link in linksToTest.distinct()) {
-                val cleanedLink = link.replace("\\/", "/")
-                if (DIRECT_VIDEO_REGEX.containsMatchIn(cleanedLink)) {
-                    callback(
-                        newExtractorLink(
-                            source = name,
-                            name = name,
-                            url = cleanedLink,
-                            type = if (".m3u8" in cleanedLink) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO,
-                        ) {
-                            this.referer = url
-                            this.quality = Qualities.Unknown.value
-                        }
-                    )
-                    found.set(true)
-                } else if (loadExtractor(cleanedLink, url, subtitleCallback, callback)) {
-                    found.set(true)
-                }
-            }
-        }
-        return found.get()
+        return doc.select(Sel.LIST_ITEM)
+            .mapNotNull { it.toSearchResult(host, null) }
+            .distinctBy { it.url }
     }
 
     private fun Element.toSearchResult(host: String, hint: TvType?): SearchResponse? {
         val link = selectFirst(Sel.ITEM_LINK) ?: return null
-        val href = fixUrl(link.attr("href"))
-        val title = (selectFirst(Sel.ITEM_TITLE)?.text() ?: link.attr("title")).trim()
+        val href = fixUrl(link.attr("href")).rehostIfOurs(mainUrl)
+        val title = selectFirst(Sel.ITEM_TITLE)?.text()?.trim()?.takeIf { it.isNotEmpty() }
+            ?: link.attr("title").trim().takeIf { it.isNotEmpty() }
+            ?: selectFirst("img")?.attr("alt")?.trim().orEmpty()
         if (title.isEmpty() || DomainManager.isBlocked(title)) return null
+
         val itemHost = runCatching { URI(href).host.normHost() }.getOrNull() ?: return null
         if (host.isNotEmpty() && itemHost != host && !itemHost.endsWith(".$host")) return null
 
-        val poster = selectFirst(Sel.ITEM_POSTER)?.imageUrl()
-        return newMovieSearchResponse(title, href, typeFromUrl(href, hint)) { posterUrl = fixUrlNull(poster) }
+        val poster = fixUrlNull(selectFirst(Sel.ITEM_POSTER)?.imageUrl())
+        poster?.let { posterCache[href.pathKey()] = it }
+
+        return newMovieSearchResponse(title, href, typeFromUrl(href, hint)) { posterUrl = poster }
     }
 
-    private fun parseEpisodes(doc: Document): List<Episode> {
-        val listLinks = doc.select(Sel.EPISODE_LIST_LINK)
-        val useList = listLinks.isNotEmpty()
+    // ---------------------------------------------------------------- detalhes
+
+    override suspend fun load(url: String): LoadResponse {
+        val doc = getDoc(url)
+        val pageUrl = url.rehostIfOurs(mainUrl)
+        val main: Element = doc.selectFirst(Sel.MAIN) ?: doc.body()
+
+        val title = doc.selectFirst(Sel.PAGE_TITLE)?.text()?.trim()?.takeIf { it.isNotEmpty() }
+            ?: doc.metaContent("og:title")
+            ?: throw ErrorLoadingException("Título não encontrado")
+
+        // Poster: 1) o mesmo da listagem  2) og:image  3) imagem do bloco principal
+        val posterCandidates = listOf(
+            "cache" to posterCache[url.pathKey()],
+            "og:image" to doc.metaContent("og:image"),
+            "itemprop" to doc.selectFirst(Sel.PAGE_POSTER)?.let { it.attr("content").ifBlank { it.attr("href") } },
+        )
+        val poster = pick(posterCandidates, GENERIC_IMG_REGEX)
+
+        // Descrição: [itemprop=description] tem o texto completo; og:description vem cortado com "..."
+        val plotCandidates = listOf(
+            "itemprop" to doc.selectFirst(Sel.PAGE_PLOT)?.text()?.trim()?.takeIf { it.isNotEmpty() },
+            "og:description" to doc.metaContent("og:description"),
+            "description" to doc.metaContent("description"),
+        )
+        val plot = pick(plotCandidates, GENERIC_TEXT_REGEX)
+
+        log("load", "url=$pageUrl título=$title")
+        log("load", "poster candidatos=$posterCandidates escolhido=$poster")
+        log("load", "plot candidatos=${plotCandidates.map { it.first to it.second?.take(80) }}")
+
+        val year = (main.selectFirst(Sel.PAGE_YEAR)?.text() ?: title)
+            .let { YEAR_REGEX.find(it)?.value?.toIntOrNull() }
+        val tags = main.select(Sel.PAGE_TAGS).map { it.text().trim() }.filter { it.isNotEmpty() }.distinct()
+
+        val episodes = parseEpisodes(main)
+        log("load", "episódios=${episodes.size}")
+
+        return if (episodes.isNotEmpty()) {
+            val crumbs = (doc.select(Sel.BREADCRUMB).map { it.text() } + tags).joinToString(" ").lowercase()
+            val type = when {
+                "dorama" in crumbs -> TvType.AsianDrama
+                "desenho" in crumbs -> TvType.Cartoon
+                "anime" in crumbs -> TvType.Anime
+                else -> typeFromUrl(pageUrl, TvType.TvSeries)
+            }
+            newTvSeriesLoadResponse(title, pageUrl, type, episodes) {
+                posterUrl = fixUrlNull(poster); this.plot = plot; this.year = year; this.tags = tags
+            }
+        } else {
+            newMovieLoadResponse(title, pageUrl, TvType.Movie, pageUrl) {
+                posterUrl = fixUrlNull(poster); this.plot = plot; this.year = year; this.tags = tags
+            }
+        }
+    }
+
+    /** Primeiro candidato não genérico; se todos forem genéricos, o primeiro não nulo. */
+    private fun pick(candidates: List<Pair<String, String?>>, generic: Regex): String? {
+        val values = candidates.mapNotNull { it.second?.takeIf { v -> v.isNotBlank() } }
+        return values.firstOrNull { !generic.containsMatchIn(it) } ?: values.firstOrNull()
+    }
+
+    private class EpisodeAcc(val name: String) {
+        val urls = LinkedHashSet<String>()
+    }
+
+    /**
+     * Dublado/legendado do mesmo episódio viram um único Episode;
+     * as URLs vão juntas no data, separadas por DATA_SEP.
+     */
+    private fun parseEpisodes(root: Element): List<Episode> {
+        val useList = root.select(Sel.EPISODE_LIST_LINK).isNotEmpty()
         val linkSelector = if (useList) Sel.EPISODE_LIST_LINK else Sel.EPISODE_DESC_LINK
 
         var currentSeason = 1
         val counters = mutableMapOf<Int, Int>()
         val seen = HashSet<String>()
-        val result = mutableListOf<Episode>()
+        val grouped = LinkedHashMap<Pair<Int, Int>, EpisodeAcc>()
 
-        for (el in doc.select("${Sel.SEASON_HEADER}, $linkSelector")) {
+        for (el in root.select("${Sel.SEASON_HEADER}, $linkSelector")) {
             if (el.`is`(linkSelector)) {
                 val text = el.text().trim()
                 if (!useList && !EP_REGEX.containsMatchIn(text) && !SE_REGEX.containsMatchIn(text)) continue
-                val href = fixUrl(el.attr("href"))
+                val href = fixUrl(el.attr("href")).rehostIfOurs(mainUrl)
                 if (!seen.add(href)) continue
 
                 val parsed = parseSeasonEpisode(text)
@@ -284,17 +335,327 @@ class HtmlSiteProvider : MainAPI() {
                 val number = parsed?.second ?: ((counters[season] ?: 0) + 1)
                 counters[season] = maxOf(counters[season] ?: 0, number)
 
-                result += newEpisode(href) {
-                    name = text
-                    this.season = season
-                    episode = number
-                }
+                val name = text.replace(EP_SUFFIX_REGEX, "").ifBlank { text }
+                grouped.getOrPut(season to number) { EpisodeAcc(name) }.urls += href
             } else if (el.children().size <= 1) {
-                SEASON_REGEX.find(el.ownText())?.groupValues?.get(1)?.toIntOrNull()?.let { currentSeason = it }
+                SEASON_REGEX.find(el.ownText())?.let { m ->
+                    m.groupValues[1].ifEmpty { m.groupValues[2] }.toIntOrNull()?.let { currentSeason = it }
+                }
             }
         }
-        return result
+
+        return grouped.map { (key, acc) ->
+            newEpisode(acc.urls.joinToString(DATA_SEP)) {
+                this.name = acc.name
+                this.season = key.first
+                this.episode = key.second
+            }
+        }
     }
+
+    private fun parseSeasonEpisode(text: String): Pair<Int?, Int>? {
+        SE_REGEX.find(text)?.let { m ->
+            val season = m.groupValues[1].ifEmpty { m.groupValues[2] }.toIntOrNull()
+            val ep = m.groupValues[3].toIntOrNull()
+            if (season != null && ep != null) return season to ep
+        }
+        return EP_REGEX.find(text)?.groupValues?.get(1)?.toIntOrNull()?.let { null to it }
+    }
+
+    // ---------------------------------------------------------------- links
+
+    override suspend fun loadLinks(
+        data: String,
+        isCasting: Boolean,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+    ): Boolean {
+        val found = AtomicBoolean(false)
+        val emitted: MutableSet<String> = ConcurrentHashMap.newKeySet()
+        val pages = data.split(DATA_SEP).map { it.trim() }.filter { it.isNotEmpty() }
+        log("loadLinks", "início: ${pages.size} página(s) $pages")
+
+        pages.amap { page ->
+            val ok = safe("loadLinks") { linksFromPage(page, subtitleCallback, callback, emitted) } ?: false
+            if (ok) found.set(true)
+        }
+
+        log("loadLinks", "fim: encontrou=${found.get()} links=${emitted.size}")
+        return found.get()
+    }
+
+    private suspend fun linksFromPage(
+        page: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+        emitted: MutableSet<String>,
+    ): Boolean {
+        val doc = getDoc(page)
+        val pageUrl = page.rehostIfOurs(mainUrl)
+        val html = doc.outerHtml().unescapeJs()
+        val ok = AtomicBoolean(false)
+
+        // 1) vídeo direto já na página do episódio/filme
+        if (scanVideos(html, pageUrl, emitted, callback)) ok.set(true)
+
+        // 2) players (DOM + URLs montadas em JS)
+        val players = findPlayers(doc, html, pageUrl)
+        log("página", "$pageUrl players=${players.size} $players")
+        if (players.isEmpty()) {
+            log("página", "nenhum player no HTML estático. Trecho do container: " +
+                (doc.selectFirst(Sel.PLAYER_CONTAINER)?.outerHtml()?.take(LOG_SNIPPET) ?: "<sem container>"))
+        }
+
+        // Player próprio do site (/player3/server.php): o link só sai via WebView.
+        // Um WebView por vídeo (distinct por vid), e os demais players são ignorados
+        // para não abrir WebView à toa (ex.: /embed.php aponta para o mesmo vídeo).
+        val rcPlayers = players.filter { RC_PLAYER_REGEX.containsMatchIn(it) }
+            .distinctBy { VID_REGEX.find(it)?.groupValues?.get(1) ?: it }
+        if (rcPlayers.isNotEmpty()) {
+            for (player in rcPlayers) {
+                val res = safe("rc") { resolveRcPlayer(player, pageUrl, subtitleCallback, callback, emitted) } ?: false
+                if (res) ok.set(true)
+            }
+            return ok.get()
+        }
+
+        players.amap { player ->
+            val res = safe("player") { followPlayer(player, pageUrl, subtitleCallback, callback, emitted) } ?: false
+            if (res) ok.set(true)
+        }
+        return ok.get()
+    }
+
+    /**
+     * Fluxo do player do Rede Canais (capturado no HAR):
+     *  server.php -> POST serverforms.api (tokens gerados por JS ofuscado em VM)
+     *  -> POST jquery.videojs.4.5.2.api (rctoken) -> URL assinada, presa ao IP, validade ~5 min:
+     *  //...null-null.shop/tos-alisg-avt-0068/proxy?container=videos&...&url=https://neosoro.gq/V/<server>/<pasta>/<vid>.mp4?...
+     * Os tokens não são reproduzíveis fora do navegador, então o server.php roda num
+     * WebView e a requisição do vídeo (o player faz um probe com Range antes de tocar)
+     * é interceptada.
+     */
+    private suspend fun resolveRcPlayer(
+        playerUrl: String,
+        referer: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+        emitted: MutableSet<String>,
+    ): Boolean {
+        addRcSubtitle(playerUrl, subtitleCallback)
+
+        log("rc", "WebView em $playerUrl")
+        val result = safe("rc-webview") {
+            WebViewResolver(
+                interceptUrl = RC_VIDEO_REGEX,
+                useOkhttp = false,
+                script = RC_PLAY_SCRIPT,
+            ).resolveUsingWebView(playerUrl, referer)
+        } ?: return false
+
+        val intercepted = result.first?.url?.toString()
+        log("rc", "interceptado=$intercepted outros=${result.second.size}")
+        if (intercepted == null) {
+            log("rc", "WebView não chegou ao vídeo (timeout, anti-bot ou API do site fora do ar)")
+            return false
+        }
+
+        val videoUrl = intercepted.unwrapRcProxy()
+        if (!emitted.add(videoUrl)) return true
+        val site = mainUrl.trimEnd('/')
+        log("vídeo", "emitindo $videoUrl")
+        callback(
+            newExtractorLink(
+                source = name,
+                name = name,
+                url = videoUrl,
+                type = ExtractorLinkType.VIDEO,
+            ) {
+                this.referer = "$site/"
+                this.quality = getQualityFromName(RC_QUALITY_REGEX.find(referer)?.value)
+                this.headers = mapOf(
+                    "User-Agent" to USER_AGENT,
+                    "Origin" to site,
+                    "X-Requested-With" to "RC-Site-Requests",
+                    RC_HEADER_NAME to RC_HEADER_VALUE,
+                )
+            }
+        )
+        return true
+    }
+
+    /** Legenda em /player3/RedeCanaisVTTS/vtts/<server>/<vid>.vtt (só se existir). */
+    private suspend fun addRcSubtitle(playerUrl: String, subtitleCallback: (SubtitleFile) -> Unit) {
+        val server = SERVER_PARAM_REGEX.find(playerUrl)?.groupValues?.get(1) ?: return
+        val vid = VID_REGEX.find(playerUrl)?.groupValues?.get(1) ?: return
+        val vtt = "${mainUrl.trimEnd('/')}/player3/RedeCanaisVTTS/vtts/$server/$vid.vtt"
+        val res = safe("vtt") { app.get(vtt, headers = siteHeaders, referer = playerUrl) } ?: return
+        if (res.isSuccessful && res.text.trimStart().startsWith("WEBVTT")) {
+            log("rc", "legenda $vtt")
+            subtitleCallback(SubtitleFile("Português", vtt))
+        }
+    }
+
+    /** "/__RC__/proxy?src=<url codificada>" é rota do service worker; a URL real está em src. */
+    private fun String.unwrapRcProxy(): String {
+        val src = RC_SW_PROXY_REGEX.find(this)?.groupValues?.get(1)
+        val real = src?.let { URLDecoder.decode(it, "UTF-8") } ?: this
+        return if (real.startsWith("//")) "https:$real" else real
+    }
+
+    private fun findPlayers(doc: Document, html: String, pageUrl: String): List<String> {
+        val scope: Element = doc.selectFirst(Sel.PLAYER_CONTAINER) ?: doc
+        val fromDom = scope.select(Sel.PLAYER).ifEmpty { doc.select(Sel.PLAYER) }
+            .filter { it.tagName() != "img" }
+            .mapNotNull { it.playerUrl() }
+
+        val fromJs = IFRAME_IN_HTML_REGEX.findAll(html).map { it.groupValues[1] } +
+            PHP_URL_REGEX.findAll(html).map { it.groupValues[1] }
+
+        return (fromDom + fromJs)
+            .map { it.unescapeJs().resolveAgainst(pageUrl) }
+            .filter {
+                it.startsWith("http") && it != pageUrl &&
+                    !it.isJunkHost() && !STATIC_ASSET_REGEX.containsMatchIn(it)
+            }
+            .distinct()
+            .take(MAX_PLAYERS)
+    }
+
+    /**
+     * Segue a cadeia player -> servidor -> vídeo, até MAX_HOPS.
+     * Em cada passo: extractor conhecido? vídeo no HTML? próximo iframe/redirect?
+     */
+    private suspend fun followPlayer(
+        start: String,
+        firstReferer: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+        emitted: MutableSet<String>,
+    ): Boolean {
+        var url = start
+        var referer = firstReferer
+        val visited = HashSet<String>()
+
+        for (hop in 0 until MAX_HOPS) {
+            if (!visited.add(url)) {
+                log("player", "hop=$hop loop em $url")
+                return false
+            }
+            if (url.isDirectVideo()) return emitDirect(url, referer, emitted, callback)
+
+            if (!url.isSameSite() && tryExtractor(url, referer, subtitleCallback, callback, hop)) return true
+
+            val res = safe("player") { app.get(url, headers = headersFor(url), referer = referer) }
+                ?: return false
+            val finalUrl = res.url
+            val html = res.text.unescapeJs()
+            log("player", "hop=$hop GET $url -> HTTP ${res.code} final=$finalUrl tamanho=${html.length}")
+
+            if (finalUrl != url && !finalUrl.isSameSite() &&
+                tryExtractor(finalUrl, url, subtitleCallback, callback, hop)
+            ) return true
+
+            if (scanVideos(html, finalUrl, emitted, callback)) return true
+
+            val next = nextHop(res.document, html)?.unescapeJs()?.resolveAgainst(finalUrl)
+            if (next.isNullOrBlank() || next == finalUrl) {
+                log("player", "hop=$hop sem próximo passo em $finalUrl. Trecho: ${html.take(LOG_SNIPPET)}")
+                return false
+            }
+            log("player", "hop=$hop próximo -> $next")
+            referer = finalUrl
+            url = next
+        }
+        log("player", "MAX_HOPS atingido a partir de $start")
+        return false
+    }
+
+    private suspend fun tryExtractor(
+        url: String,
+        referer: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+        hop: Int,
+    ): Boolean {
+        val ok = safe("extractor") { loadExtractor(url, referer, subtitleCallback, callback) } == true
+        log("player", "hop=$hop extractor($url) = $ok")
+        return ok
+    }
+
+    private fun nextHop(doc: Document, html: String): String? {
+        doc.selectFirst("meta[http-equiv~=(?i)refresh]")?.attr("content")
+            ?.let { META_URL_REGEX.find(it)?.groupValues?.get(1) }
+            ?.replace(QUOTES_REGEX, "")?.trim()
+            ?.takeIf { it.isNotEmpty() }
+            ?.let { return it }
+
+        val container = doc.selectFirst(Sel.PLAYER_CONTAINER)
+        val iframes = (container?.select("iframe").orEmpty() + doc.select("iframe"))
+            .mapNotNull { it.playerUrl() }
+        iframes.firstOrNull { !it.isJunkHost() }?.let { return it }
+
+        IFRAME_IN_HTML_REGEX.findAll(html).map { it.groupValues[1] }
+            .firstOrNull { !it.isJunkHost() && !STATIC_ASSET_REGEX.containsMatchIn(it) }
+            ?.let { return it }
+
+        JS_LOCATION_REGEX.find(html)?.groupValues?.let { it[1].ifEmpty { it[2] } }
+            ?.takeIf { it.isNotBlank() && it != "/" }
+            ?.let { return it }
+
+        return BASE64_REGEX.findAll(html)
+            .mapNotNull { m -> m.groupValues[1].ifEmpty { m.groupValues[2] }.decodeBase64() }
+            .firstOrNull()
+    }
+
+    private suspend fun scanVideos(
+        html: String,
+        base: String,
+        emitted: MutableSet<String>,
+        callback: (ExtractorLink) -> Unit,
+    ): Boolean {
+        val raw = buildList {
+            DIRECT_VIDEO_URL_REGEX.findAll(html).forEach { add(it.value) }
+            SOURCE_TAG_REGEX.findAll(html).forEach { add(it.groupValues[1]) }
+            FILE_KEY_REGEX.findAll(html).forEach { add(it.groupValues[1]) }
+            BASE64_REGEX.findAll(html).forEach { m ->
+                m.groupValues[1].ifEmpty { m.groupValues[2] }.decodeBase64()?.let { add(it) }
+            }
+        }
+        val urls = raw.map { it.resolveAgainst(base) }.filter { it.isDirectVideo() }.distinct()
+        var ok = false
+        for (u in urls) if (emitDirect(u, base, emitted, callback)) ok = true
+        return ok
+    }
+
+    private suspend fun emitDirect(
+        videoUrl: String,
+        referer: String,
+        emitted: MutableSet<String>,
+        callback: (ExtractorLink) -> Unit,
+    ): Boolean {
+        if (!emitted.add(videoUrl)) return true
+        log("vídeo", "emitindo $videoUrl (referer=$referer)")
+        callback(
+            newExtractorLink(
+                source = name,
+                name = name,
+                url = videoUrl,
+                type = if (".m3u8" in videoUrl.lowercase()) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO,
+            ) {
+                this.referer = referer
+                this.quality = getQualityFromName(QUALITY_REGEX.find(videoUrl)?.value)
+                this.headers = mapOf("User-Agent" to USER_AGENT)
+            }
+        )
+        return true
+    }
+
+    // ---------------------------------------------------------------- extensões
+
+    private fun Document.metaContent(key: String): String? =
+        selectFirst("meta[property=\"$key\"], meta[name=\"$key\"]")?.attr("content")
+            ?.trim()?.takeIf { it.isNotEmpty() }
 
     private fun Element.imageUrl(): String? =
         listOf("data-echo", "data-src", "data-lazy-src", "data-original", "src")
@@ -306,43 +667,30 @@ class HtmlSiteProvider : MainAPI() {
             .map { attr(it).trim() }
             .firstOrNull { it.isNotBlank() && it != "about:blank" && !it.startsWith("javascript:") }
 
-    private fun parseSeasonEpisode(text: String): Pair<Int?, Int>? {
-        SE_REGEX.find(text)?.let { m ->
-            return m.groupValues[1].toInt() to m.groupValues[2].toInt()
-        }
-        return EP_REGEX.find(text)?.groupValues?.get(1)?.toIntOrNull()?.let { null to it }
-    }
+    private fun String.rehostIfOurs(base: String): String = runCatching {
+        val u = URI(this)
+        val host = u.host ?: return this
+        if (!host.contains(domainKey) || host.normHost() == URI(base).host.normHost()) return this
+        base.trimEnd('/') + (u.rawPath ?: "") + (u.rawQuery?.let { "?$it" } ?: "")
+    }.getOrDefault(this)
 
-    private suspend fun resolveRedirects(url: String, referer: String, depth: Int = 0): String {
-        if (depth >= MAX_REDIRECT_DEPTH || !url.isSameSite()) return url
-
-        val res = app.get(url, headers = headers, referer = referer)
-        val current = res.url
-        if (!current.isSameSite()) return current
-
-        val html = res.text
-        val doc = res.document
-
-        val metaRefresh = doc.selectFirst("meta[http-equiv~=(?i)refresh]")?.attr("content")
-            ?.let { META_URL_REGEX.find(it)?.groupValues?.get(1) }
-            ?.replace(QUOTES_REGEX, "")?.trim()
-            ?.takeIf { it.isNotEmpty() }
-
-        val iframe = (doc.selectFirst(Sel.PLAYER_CONTAINER)?.selectFirst("iframe") ?: doc.selectFirst("iframe"))
-            ?.playerUrl()
-
-        val next = iframe
-            ?: metaRefresh
-            ?: JS_LOCATION_REGEX.find(html)?.groupValues?.let { it[1].ifEmpty { it[2] } }
-            ?: BASE64_REGEX.find(html)?.groupValues?.let { it[1].ifEmpty { it[2] } }?.decodeBase64()
-            ?: return current
-
-        if (next.isBlank()) return current
-        return resolveRedirects(next.resolveAgainst(current), referer = current, depth = depth + 1)
-    }
+    private fun String.pathKey(): String = runCatching {
+        val u = URI(this)
+        (u.rawPath ?: "") + (u.rawQuery?.let { "?$it" } ?: "")
+    }.getOrDefault(this)
 
     private fun String.resolveAgainst(base: String): String =
-        runCatching { URI(base).resolve(this.replace(" ", "%20")).toString() }.getOrElse { fixUrl(this) }
+        runCatching { URI(base).resolve(this.trim().replace(" ", "%20")).toString() }.getOrElse { fixUrl(this) }
+
+    private fun String.unescapeJs(): String =
+        replace("\\/", "/").replace("\\u0026", "&").replace("&amp;", "&")
+
+    private fun String.isDirectVideo(): Boolean = DIRECT_VIDEO_REGEX.containsMatchIn(this)
+
+    private fun String.isJunkHost(): Boolean = runCatching {
+        val h = URI(this).host?.normHost() ?: return@runCatching false
+        JUNK_HOSTS.any { h == it || h.endsWith(".$it") }
+    }.getOrDefault(false)
 
     private fun currentHost(): String = runCatching { URI(mainUrl).host.normHost() }.getOrDefault("")
 
@@ -360,23 +708,73 @@ class HtmlSiteProvider : MainAPI() {
             ?.takeIf { it.startsWith("http") || it.startsWith("/") }
 
     private companion object {
-        const val MAX_REDIRECT_DEPTH = 4
-        val PAGE_REGEX = Regex("-\\d+-date\\.html$")
-        val YEAR_REGEX = Regex("\\b(19|20)\\d{2}\\b")
-        val SE_REGEX = Regex("(?i)\\b[st]?(\\d{1,2})\\s*[xe]\\s*(\\d{1,3})\\b")
-        val EP_REGEX = Regex("(?i)\\bep(?:is[oó]dio)?\\.?\\s*(\\d+)")
-        val SEASON_REGEX = Regex("(?i)temporada\\s*(\\d+)")
-        val META_URL_REGEX = Regex("(?i)url\\s*=\\s*(.+)$")
-        val DIRECT_VIDEO_REGEX = Regex("(?i)\\.(m3u8|mp4)(\\?|#|$)")
-        val VID_REGEX = Regex("vid=([A-Za-z0-9_-]+)")
-        val DIRECT_VIDEO_URL_REGEX = Regex("https?://[^\"'\\s]+\\.(?:mp4|m3u8)(?:\\?[^\"'\\s]*)?")
+        const val TAG = "RedeCanais"
+        const val USER_AGENT =
+            "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+        const val DATA_SEP = "\n"
+        const val MAX_HOPS = 5
+        const val MAX_PLAYERS = 15
+        const val LOG_SNIPPET = 1500
+        val BLOCK_CODES = setOf(403, 429, 503)
 
-        val QUOTES_REGEX = Regex("[\\x22\\x27]")
+        val JUNK_HOSTS = listOf(
+            "facebook.com", "twitter.com", "x.com", "whatsapp.com", "t.me", "telegram.me",
+            "pinterest.com", "googletagmanager.com", "google-analytics.com",
+            "googlesyndication.com", "doubleclick.net", "disqus.com", "addthis.com", "sharethis.com",
+            "chatango.com",
+        )
+
+        val PAGE_REGEX = Regex("""-\d+-date\.html$""")
+        val YEAR_REGEX = Regex("""\b(19|20)\d{2}\b""")
+
+        /** S01E02, T1E2, 1x02. "1 e 2" (conjunção) NÃO casa. */
+        val SE_REGEX = Regex("""(?i)\b(?:[st](\d{1,2})\s*e|(\d{1,2})\s*x)\s*(\d{1,3})\b""")
+
+        /** Ep 3, Episódio 3, Cap. 3, Capítulo 3 */
+        val EP_REGEX = Regex("""(?i)\b(?:ep(?:is[oó]dio)?|cap(?:[ií]tulo)?)\.?\s*(\d+)""")
+
+        /** "Temporada 2" ou "2ª Temporada" */
+        val SEASON_REGEX = Regex("""(?i)(?:temporada\s*(\d+)|(\d+)\s*[ªºa°]?\s*temporada)""")
+
+        val EP_SUFFIX_REGEX = Regex("""(?i)\s*[-–|]?\s*\(?\b(?:dublado|legendado|dub|leg)\b\)?\s*$""")
+
+        val META_URL_REGEX = Regex("""(?i)url\s*=\s*(.+)$""")
+        val QUOTES_REGEX = Regex("""["']""")
+
+        val DIRECT_VIDEO_REGEX = Regex("""(?i)\.(m3u8|mp4)(\?|#|$)""")
+        val DIRECT_VIDEO_URL_REGEX = Regex("""https?://[^"'\s<>]+\.(?:mp4|m3u8)(?:\?[^"'\s<>]*)?""")
+        val SOURCE_TAG_REGEX = Regex("""(?i)<source[^>]+src\s*=\s*["']([^"']+)["']""")
+        val FILE_KEY_REGEX = Regex("""(?i)["']?\b(?:file|src|source|url|hls|video)["']?\s*[:=]\s*["']([^"']+)["']""")
+        val QUALITY_REGEX = Regex("""(?i)\b(\d{3,4})p\b""")
+
+        val IFRAME_IN_HTML_REGEX = Regex("""(?i)<iframe[^>]*?\ssrc\s*=\s*\\?["']([^"'\\]+)""")
+        val PHP_URL_REGEX = Regex("""["']((?:https?:)?//[^"'\s]+?\.php\?[^"'\s]+|/[^"'\s]+?\.php\?[^"'\s]+)["']""")
+        val STATIC_ASSET_REGEX = Regex("""(?i)\.(?:js|css|png|jpe?g|gif|webp|svg|ico|woff2?|ttf)(?:\?|$)""")
+
+        // ---- player do Rede Canais
+        val RC_PLAYER_REGEX = Regex("""/player\d*/server\.php\?""")
+        val VID_REGEX = Regex("""[?&]vid=([A-Za-z0-9_-]+)""")
+        val SERVER_PARAM_REGEX = Regex("""[?&]server=([A-Za-z0-9_-]+)""")
+        /** Requisição do vídeo: proxy null-null.shop ou rota do service worker. Anúncios (servetraff) não casam. */
+        val RC_VIDEO_REGEX = Regex("""null-null\.shop/[^?\s]*proxy[^?\s]*\?|/__RC__/proxy\?src=""")
+        val RC_SW_PROXY_REGEX = Regex("""/__RC__/proxy\?src=([^&]+)""")
+        val RC_QUALITY_REGEX = Regex("""(?i)(?<!\d)(2160|1440|1080|720|480|360)p""")
+        const val RC_HEADER_NAME = "h31ffadrg3bb7"
+        const val RC_HEADER_VALUE = "h31ffadrg3fj345a"
+        /** Força o player a pedir o vídeo caso o autoplay seja bloqueado no WebView. */
+        const val RC_PLAY_SCRIPT =
+            "(function(){try{var v=document.querySelector('video');if(v){v.muted=true;" +
+                "var p=v.play();if(p&&p.catch)p.catch(function(){});}" +
+                "var b=document.querySelector('.vjs-big-play-button');if(b)b.click();}catch(e){}})()"
+
+        val GENERIC_IMG_REGEX = Regex("""(?i)(logo|favicon|default|placeholder|no-?image|banner)""")
+        val GENERIC_TEXT_REGEX = Regex("""(?i)rede\s*canais""")
+
         val JS_LOCATION_REGEX = Regex(
-            "(?:window\\.|document\\.)?location(?:\\.href)?\\s*(?:=\\s*|\\.(?:replace|assign)\\(\\s*)(?:\\x22([^\\x22]+)\\x22|\\x27([^\\x27]+)\\x27)"
+            """(?:window\.|document\.|top\.)?location(?:\.href)?\s*(?:=\s*|\.(?:replace|assign)\(\s*)(?:"([^"]+)"|'([^']+)')"""
         )
         val BASE64_REGEX = Regex(
-            "atob\\(\\s*(?:\\x22([A-Za-z0-9+/=]{16,})\\x22|\\x27([A-Za-z0-9+/=]{16,})\\x27)\\s*\\)"
+            """atob\(\s*(?:"([A-Za-z0-9+/=]{16,})"|'([A-Za-z0-9+/=]{16,})')\s*\)"""
         )
     }
 }
