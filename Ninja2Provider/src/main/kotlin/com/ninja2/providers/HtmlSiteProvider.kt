@@ -42,7 +42,7 @@ import kotlin.coroutines.cancellation.CancellationException
  */
 class HtmlSiteProvider : MainAPI() {
 
-    override var name = "Rede Canais V14"
+    override var name = "Rede Canais V15"
     override var mainUrl = "https://redecanais.by"
     override var lang = "pt-br"
     override val hasMainPage = true
@@ -470,25 +470,77 @@ class HtmlSiteProvider : MainAPI() {
         val videoUrl = captured.unwrapRcProxy()
         if (!emitted.add(videoUrl)) return true
         val site = mainUrl.trimEnd('/')
-        log("vídeo", "emitindo $videoUrl")
-        callback(
-            newExtractorLink(
-                source = name,
-                name = name,
-                url = videoUrl,
-                type = ExtractorLinkType.VIDEO,
-            ) {
-                this.referer = "$site/"
-                this.quality = getQualityFromName(RC_QUALITY_REGEX.find(referer)?.value)
-                this.headers = mapOf(
-                    "User-Agent" to USER_AGENT,
-                    "Origin" to site,
-                    "X-Requested-With" to "RC-Site-Requests",
-                    RC_HEADER_NAME to RC_HEADER_VALUE,
-                )
-            }
+        val quality = getQualityFromName(RC_QUALITY_REGEX.find(referer)?.value)
+        val playHeaders = mapOf(
+            "User-Agent" to USER_AGENT,
+            "Origin" to site,
+            "X-Requested-With" to "RC-Site-Requests",
+            RC_HEADER_NAME to RC_HEADER_VALUE,
         )
+
+        // O host do proxy ("-_kerberos-__tcp-...null-null.shop") começa com hífen e tem "_";
+        // o DNS do Android pode recusar. Testa o original e variantes antes de entregar.
+        val variants = rcVariants(videoUrl)
+        val results = variants.amap { (label, u) -> Triple(label, u, preflight(u, "$site/", playHeaders)) }
+        log("vídeo", "testes: ${results.map { it.first + "=" + it.third }}")
+
+        val working = results.filter { it.third.startsWith("2") }
+        val toEmit = working.ifEmpty { results.take(1) }   // nenhum passou: entrega o original mesmo assim
+        for ((label, u, _) in toEmit) {
+            callback(
+                newExtractorLink(
+                    source = name,
+                    name = "$name $label",
+                    url = u,
+                    type = ExtractorLinkType.VIDEO,
+                ) {
+                    this.referer = "$site/"
+                    this.quality = quality
+                    this.headers = playHeaders
+                }
+            )
+        }
+        if (DEBUG_LINKS) {
+            debugLink("teste: " + results.joinToString(" | ") { "${it.first}=${it.third}" } +
+                " | host=" + runCatching { URI(videoUrl).authority }.getOrNull(), callback)
+        }
         return true
+    }
+
+    /**
+     * Variantes do mesmo link assinado:
+     *  proxy     -> URL original
+     *  proxy-alt -> mesmo caminho, subdomínio simples (a Cloudflare roteia pelo domínio)
+     *  proxy-raiz-> domínio sem subdomínio
+     *  direto    -> URL de origem que está dentro do parâmetro url= (neosoro.gq)
+     */
+    private fun rcVariants(videoUrl: String): List<Pair<String, String>> {
+        val out = mutableListOf("proxy" to videoUrl)
+        runCatching {
+            val u = URI(videoUrl)
+            val host = u.host ?: u.authority
+            val root = PROXY_ROOT_REGEX.find(host)?.value
+            if (root != null && host != root) {
+                val rest = videoUrl.substringAfter(host)
+                out += "proxy-alt" to "https://v.$root$rest"
+                out += "proxy-raiz" to "https://$root$rest"
+            }
+        }
+        INNER_URL_REGEX.find(videoUrl)?.groupValues?.get(1)?.let { inner ->
+            val decoded = if (inner.startsWith("http")) inner else URLDecoder.decode(inner, "UTF-8")
+            if (decoded.startsWith("http")) out += "direto" to decoded
+        }
+        return out.distinctBy { it.second }
+    }
+
+    /** GET com Range de 2 bytes. Devolve o status HTTP ou o nome da exceção (ex.: UnknownHostException). */
+    private suspend fun preflight(url: String, referer: String, headers: Map<String, String>): String = try {
+        val res = app.get(url, headers = headers + ("Range" to "bytes=0-1"), referer = referer, timeout = 15L)
+        res.code.toString()
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        e.javaClass.simpleName + (e.message?.let { ":" + it.take(50) } ?: "")
     }
 
     /** Legenda em /player3/RedeCanaisVTTS/vtts/<server>/<vid>.vtt (só se existir). */
@@ -790,6 +842,10 @@ class HtmlSiteProvider : MainAPI() {
          * player e "avisa" navegando um iframe para um host sentinela, que o interceptador vê.
          * Se em ~50 s não achar, avisa com ?err=<estado> para diagnóstico.
          */
+        /** Domínio registrável do proxy (ex.: null-null.shop) dentro de um host qualquer. */
+        val PROXY_ROOT_REGEX = Regex("""[A-Za-z0-9-]+\.[A-Za-z]{2,}$""")
+        /** URL de origem dentro do proxy: ...proxy?...&url=<https://neosoro.gq/...> (vai até o fim). */
+        val INNER_URL_REGEX = Regex("""[?&]url=(https?(?::|%3A).+)$""")
         const val RC_CAPTURE_HOST = "rc-capture.invalid"
         val RC_INTERCEPT_REGEX = Regex("""rc-capture\.invalid|null-null\.shop/[^?\s]*proxy[^?\s]*\?|/__RC__/proxy\?src=""")
         val CAPTURE_URL_REGEX = Regex("""[?&]u=([^&]+)""")
