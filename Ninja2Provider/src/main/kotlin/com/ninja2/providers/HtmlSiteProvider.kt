@@ -42,7 +42,7 @@ import kotlin.coroutines.cancellation.CancellationException
  */
 class HtmlSiteProvider : MainAPI() {
 
-    override var name = "Rede Canais V11"
+    override var name = "Rede Canais V8"
     override var mainUrl = "https://redecanais.by"
     override var lang = "pt-br"
     override val hasMainPage = true
@@ -447,20 +447,27 @@ class HtmlSiteProvider : MainAPI() {
         log("rc", "WebView em $playerUrl")
         val result = safe("rc-webview") {
             WebViewResolver(
-                interceptUrl = RC_VIDEO_REGEX,
+                interceptUrl = RC_INTERCEPT_REGEX,
                 useOkhttp = false,
-                script = RC_PLAY_SCRIPT,
+                script = RC_CAPTURE_SCRIPT,
             ).resolveUsingWebView(playerUrl, referer)
-        } ?: return false
+        } ?: return debugLink("WebView falhou ao iniciar", callback)
 
         val intercepted = result.first?.url?.toString()
         log("rc", "interceptado=$intercepted outros=${result.second.size}")
         if (intercepted == null) {
-            log("rc", "WebView não chegou ao vídeo (timeout, anti-bot ou API do site fora do ar)")
-            return false
+            return debugLink("timeout: o script de captura não respondeu (página não carregou ou bloqueou o WebView)", callback)
         }
 
-        val videoUrl = intercepted.unwrapRcProxy()
+        // Sentinela do script: ?u=<url do vídeo> ou ?err=<estado do player>
+        val captured = if (RC_CAPTURE_HOST in intercepted) {
+            val err = CAPTURE_ERR_REGEX.find(intercepted)?.groupValues?.get(1)?.let { URLDecoder.decode(it, "UTF-8") }
+            if (err != null) return debugLink("player sem vídeo: $err", callback)
+            CAPTURE_URL_REGEX.find(intercepted)?.groupValues?.get(1)?.let { URLDecoder.decode(it, "UTF-8") }
+                ?: return debugLink("sentinela sem URL", callback)
+        } else intercepted
+
+        val videoUrl = captured.unwrapRcProxy()
         if (!emitted.add(videoUrl)) return true
         val site = mainUrl.trimEnd('/')
         log("vídeo", "emitindo $videoUrl")
@@ -494,6 +501,24 @@ class HtmlSiteProvider : MainAPI() {
             log("rc", "legenda $vtt")
             subtitleCallback(SubtitleFile("Português", vtt))
         }
+    }
+
+    /**
+     * Com DEBUG_LINKS, a falha aparece na lista de fontes como "[DEBUG] motivo".
+     * O link não toca; é só para ler o motivo. Desligue DEBUG_LINKS depois.
+     */
+    private suspend fun debugLink(reason: String, callback: (ExtractorLink) -> Unit): Boolean {
+        log("rc", "falha: $reason")
+        if (!DEBUG_LINKS) return false
+        callback(
+            newExtractorLink(
+                source = name,
+                name = "[DEBUG] ${reason.take(180)}",
+                url = "https://$RC_CAPTURE_HOST/debug.mp4",
+                type = ExtractorLinkType.VIDEO,
+            )
+        )
+        return true
     }
 
     /** "/__RC__/proxy?src=<url codificada>" é rota do service worker; a URL real está em src. */
@@ -755,17 +780,69 @@ class HtmlSiteProvider : MainAPI() {
         val RC_PLAYER_REGEX = Regex("""/player\d*/server\.php\?""")
         val VID_REGEX = Regex("""[?&]vid=([A-Za-z0-9_-]+)""")
         val SERVER_PARAM_REGEX = Regex("""[?&]server=([A-Za-z0-9_-]+)""")
-        /** Requisição do vídeo: proxy null-null.shop ou rota do service worker. Anúncios (servetraff) não casam. */
-        val RC_VIDEO_REGEX = Regex("""null-null\.shop/[^?\s]*proxy[^?\s]*\?|/__RC__/proxy\?src=""")
         val RC_SW_PROXY_REGEX = Regex("""/__RC__/proxy\?src=([^&]+)""")
         val RC_QUALITY_REGEX = Regex("""(?i)(?<!\d)(2160|1440|1080|720|480|360)p""")
         const val RC_HEADER_NAME = "h31ffadrg3bb7"
         const val RC_HEADER_VALUE = "h31ffadrg3fj345a"
-        /** Força o player a pedir o vídeo caso o autoplay seja bloqueado no WebView. */
-        const val RC_PLAY_SCRIPT =
-            "(function(){try{var v=document.querySelector('video');if(v){v.muted=true;" +
-                "var p=v.play();if(p&&p.catch)p.catch(function(){});}" +
-                "var b=document.querySelector('.vjs-big-play-button');if(b)b.click();}catch(e){}})()"
+        /**
+         * O vídeo é pedido pelo service worker / pelo elemento <video>, e o WebView do Android
+         * não repassa essas requisições ao interceptador. Então o script lê a URL no próprio
+         * player e "avisa" navegando um iframe para um host sentinela, que o interceptador vê.
+         * Se em ~40 s não achar, avisa com ?err=<estado> para diagnóstico.
+         */
+        const val RC_CAPTURE_HOST = "rc-capture.invalid"
+        val RC_INTERCEPT_REGEX = Regex("""rc-capture\.invalid|null-null\.shop/[^?\s]*proxy[^?\s]*\?|/__RC__/proxy\?src=""")
+        val CAPTURE_URL_REGEX = Regex("""[?&]u=([^&]+)""")
+        val CAPTURE_ERR_REGEX = Regex("""[?&]err=([^&]+)""")
+        val RC_CAPTURE_SCRIPT = """
+            (function(){
+              if (window.__rcCap) return 'dup'; window.__rcCap = 1;
+              var n = 0, H = 'https://$RC_CAPTURE_HOST/';
+              function ok(c){ return c && c.indexOf('blob:') !== 0 && !/servetraff|2mdn|doubleclick/.test(c)
+                                && /null-null|__RC__|\.mp4|\.m3u8/.test(c); }
+              function send(q){
+                var u = H + '?' + q;
+                try { var f = document.createElement('iframe'); f.style.display = 'none'; f.src = u;
+                      (document.body || document.documentElement).appendChild(f); } catch(e) {}
+                setTimeout(function(){ location.href = u; }, 1500);
+              }
+              var t = setInterval(function(){
+                n++;
+                try {
+                  var s = null, vs = document.querySelectorAll('video');
+                  for (var i = 0; i < vs.length && !s; i++) {
+                    var v = vs[i], c = v.currentSrc || v.src || '';
+                    if (ok(c)) s = c;
+                    else if (!v.src) { var so = v.querySelector('source'); if (so && ok(so.src)) s = so.src; }
+                    if (!s) { v.muted = true; try { var p = v.play(); if (p && p.catch) p.catch(function(){}); } catch(e) {} }
+                  }
+                  if (!s && window.videojs && videojs.getPlayers) {
+                    var ps = videojs.getPlayers();
+                    for (var k in ps) { try { var c2 = ps[k] && ps[k].currentSrc(); if (ok(c2)) s = c2; } catch(e) {} }
+                  }
+                  if (!s && n % 4 === 0) { var b = document.querySelector('.vjs-big-play-button, .vjs-play-control, [class*=play]'); if (b) b.click(); }
+                  if (s) { clearInterval(t); send('u=' + encodeURIComponent(s)); return; }
+                } catch(e) {}
+                if (n >= 80) {
+                  clearInterval(t);
+                  var e1 = document.querySelector('.vjs-error-display, .vjs-modal-dialog-content');
+                  var st = 'videos=' + document.querySelectorAll('video').length
+                    + ' videojs=' + !!window.videojs
+                    + ' sw=' + !!(navigator.serviceWorker && navigator.serviceWorker.controller)
+                    + ' iframes=' + document.querySelectorAll('iframe').length
+                    + ' estado=' + document.readyState
+                    + ' titulo=' + (document.title || '').slice(0, 40)
+                    + ' erro=' + (e1 ? (e1.innerText || '').slice(0, 80) : '')
+                    + ' texto=' + ((document.body && document.body.innerText) || '').replace(/\s+/g, ' ').slice(0, 120);
+                  send('err=' + encodeURIComponent(st));
+                }
+              }, 500);
+              return 'ok';
+            })();
+        """.trimIndent()
+
+        /** true = mostra o motivo da falha como um "link" na lista de fontes (sem precisar de adb). */
+        const val DEBUG_LINKS = true
 
         val GENERIC_IMG_REGEX = Regex("""(?i)(logo|favicon|default|placeholder|no-?image|banner)""")
         val GENERIC_TEXT_REGEX = Regex("""(?i)rede\s*canais""")
