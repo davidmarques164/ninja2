@@ -42,7 +42,7 @@ import kotlin.coroutines.cancellation.CancellationException
  */
 class HtmlSiteProvider : MainAPI() {
 
-    override var name = "Rede Canais V8"
+    override var name = "Rede Canais V13"
     override var mainUrl = "https://redecanais.by"
     override var lang = "pt-br"
     override val hasMainPage = true
@@ -513,7 +513,7 @@ class HtmlSiteProvider : MainAPI() {
         callback(
             newExtractorLink(
                 source = name,
-                name = "[DEBUG] ${reason.take(180)}",
+                name = "[DEBUG] ${reason.take(400)}",
                 url = "https://$RC_CAPTURE_HOST/debug.mp4",
                 type = ExtractorLinkType.VIDEO,
             )
@@ -826,14 +826,24 @@ class HtmlSiteProvider : MainAPI() {
                 if (n >= 80) {
                   clearInterval(t);
                   var e1 = document.querySelector('.vjs-error-display, .vjs-modal-dialog-content');
-                  var st = 'videos=' + document.querySelectorAll('video').length
+                  var K = /serverforms|videojs\.4\.5\.2|null-null|__RC__|dns\.camera|probe/;
+                  var api = [];
+                  try {
+                    performance.getEntriesByType('resource').forEach(function(r){
+                      var m = r.name.match(K);
+                      if (m) api.push(m[0].replace('videojs.4.5.2', 'ticket') + ':' + (r.responseStatus || '?') + '/' + Math.round(r.duration) + 'ms');
+                    });
+                  } catch(e) { api.push('perf-erro'); }
+                  var body = document.body;
+                  var st = 'api=[' + (api.length ? api.join(',') : 'nenhuma') + ']'
+                    + ' videos=' + document.querySelectorAll('video').length
                     + ' videojs=' + !!window.videojs
                     + ' sw=' + !!(navigator.serviceWorker && navigator.serviceWorker.controller)
-                    + ' iframes=' + document.querySelectorAll('iframe').length
-                    + ' estado=' + document.readyState
-                    + ' titulo=' + (document.title || '').slice(0, 40)
-                    + ' erro=' + (e1 ? (e1.innerText || '').slice(0, 80) : '')
-                    + ' texto=' + ((document.body && document.body.innerText) || '').replace(/\s+/g, ' ').slice(0, 120);
+                    + ' elems=' + (body ? body.getElementsByTagName('*').length : -1)
+                    + ' html=' + document.documentElement.outerHTML.length
+                    + ' tags=' + (body ? Array.prototype.slice.call(body.children, 0, 6).map(function(c){ return c.tagName + (c.id ? '#' + c.id : ''); }).join('|') : '')
+                    + ' erro=' + (e1 ? (e1.innerText || '').slice(0, 60) : '')
+                    + ' texto=' + ((body && body.innerText) || '').replace(/\s+/g, ' ').slice(0, 60);
                   send('err=' + encodeURIComponent(st));
                 }
               }, 500);
