@@ -78,7 +78,7 @@ import java.util.concurrent.TimeUnit
  */
 class HtmlSiteProvider : MainAPI() {
 
-    override var name = "Rede Canais V27"
+    override var name = "Rede Canais V28"
     override var mainUrl = "https://redecanais.by"
     override var lang = "pt-br"
     override val hasMainPage = true
@@ -350,7 +350,15 @@ class HtmlSiteProvider : MainAPI() {
 
         // Descrição: [itemprop=description] tem o texto completo; og:description vem cortado com "..."
         // Em série, [itemprop=description] é a lista de episódios: a sinopse fica nas metas.
-        val episodes = parseEpisodes(main)
+        var episodes = parseEpisodes(main)
+        // Regra de segurança: página "Lista de Episódios" nunca vira filme. Se o leitor normal não
+        // achou nada (formato diferente), todo link para página de vídeo vira episódio, em ordem.
+        val isLista = LIST_SUFFIX_REGEX.containsMatchIn(rawTitle) || "lista-de-episodios" in url
+        if (episodes.isEmpty() && isLista) {
+            episodes = parseEpisodes(main, relaxed = true, pageUrl = url)
+            log("load", "lista sem formato conhecido: leitor permissivo achou ${episodes.size} episódios")
+            if (episodes.isEmpty()) throw ErrorLoadingException("Nenhum episódio encontrado nesta lista")
+        }
         val plotCandidates = if (episodes.isNotEmpty()) listOf(
             "og:description" to doc.metaContent("og:description"),
             "description" to doc.metaContent("description"),
@@ -539,9 +547,16 @@ class HtmlSiteProvider : MainAPI() {
      * Dublado/legendado do mesmo episódio viram um único Episode;
      * as URLs vão juntas no data, separadas por DATA_SEP.
      */
-    private fun parseEpisodes(root: Element): List<Episode> {
-        val useList = root.select(Sel.EPISODE_LIST_LINK).isNotEmpty()
-        val linkSelector = if (useList) Sel.EPISODE_LIST_LINK else Sel.EPISODE_DESC_LINK
+    private fun parseEpisodes(root: Element, relaxed: Boolean = false, pageUrl: String = ""): List<Episode> {
+        val useList = !relaxed && root.select(Sel.EPISODE_LIST_LINK).isNotEmpty()
+        val linkSelector = when {
+            useList -> Sel.EPISODE_LIST_LINK
+            !relaxed -> Sel.EPISODE_DESC_LINK
+            // permissivo: links da descrição; se nenhum for de vídeo, qualquer link da página
+            root.select(Sel.EPISODE_DESC_LINK).any { VIDEO_PAGE_REGEX.containsMatchIn(it.attr("href")) } -> Sel.EPISODE_DESC_LINK
+            else -> "a[href]"
+        }
+        val selfPath = runCatching { URI(pageUrl).rawPath }.getOrNull().orEmpty()
 
         var currentSeason = 1
         val counters = mutableMapOf<Int, Int>()
@@ -554,7 +569,12 @@ class HtmlSiteProvider : MainAPI() {
                 // linha, antes do link: "<strong>Episódio 01 - </strong>Nome - <a>Assistir</a><br>"
                 val prefix = if (useList) "" else lineTextBefore(el)
                 val text = if (useList) el.text().trim() else "$prefix ${el.text()}".trim()
-                if (!useList && !EP_REGEX.containsMatchIn(text) && !SE_REGEX.containsMatchIn(text)) continue
+                if (relaxed) {
+                    val rawHref = el.attr("href")
+                    if (!VIDEO_PAGE_REGEX.containsMatchIn(rawHref)) continue
+                    if (selfPath.isNotEmpty() && rawHref.substringBefore('?').endsWith(selfPath)) continue
+                    if (el.parents().any { it.`is`(NOT_EPISODE_AREA) }) continue
+                } else if (!useList && !EP_REGEX.containsMatchIn(text) && !SE_REGEX.containsMatchIn(text)) continue
                 val href = fixUrl(el.attr("href")).rehostIfOurs(mainUrl)
                 if (!seen.add(href)) continue
 
@@ -565,7 +585,9 @@ class HtmlSiteProvider : MainAPI() {
                 val number = parsed?.second ?: ((counters[season] ?: 0) + 1)
                 counters[season] = maxOf(counters[season] ?: 0, number)
 
-                val name = if (!useList && prefix.isNotBlank()) {
+                val name = if (relaxed && prefix.isBlank() && GENERIC_LINK_TEXT_REGEX.matches(el.text())) {
+                    "Episódio $number"
+                } else if (!useList && prefix.isNotBlank()) {
                     val afterNum = EP_REGEX.find(prefix)?.let { prefix.substring(it.range.last + 1) } ?: prefix
                     afterNum.trim().trim('-', '–', '|', ' ').trim().replace(EP_SUFFIX_REGEX, "")
                         .ifBlank { "Episódio $number" }
@@ -1121,6 +1143,11 @@ class HtmlSiteProvider : MainAPI() {
         val LINK_IP_REGEX = Regex("""[?&]ip=([0-9.]+)""")
         val LINK_IP6_REGEX = Regex("""[?&]ipv6=([0-9a-fA-F:]+)""")
         val TRACE_IP_REGEX = Regex("""(?m)^ip=(\S+)""")
+        /** Página de vídeo do site: /nome-do-video_<hash>.html */
+        val VIDEO_PAGE_REGEX = Regex("""/[^/?#]+_[0-9a-f]{6,12}\.html(?:$|[?#])""")
+        /** Áreas que nunca são episódios: relacionados, listagens, menu, rodapé. */
+        const val NOT_EPISODE_AREA = "ul.pm-ul-browse-videos, ul.pm-ul-carousel-videos, nav, header, footer, .breadcrumb, .pm-related-videos, #pm-related"
+        val GENERIC_LINK_TEXT_REGEX = Regex("""(?i)^\s*(assistir|ver|play|clique aqui|link|online)?\s*$""")
         const val SEARCH_LIMIT = 80
         /** Quantos resultados da busca recebem pôster do TMDB, e o prazo total para isso. */
         const val SEARCH_POSTER_COUNT = 20
