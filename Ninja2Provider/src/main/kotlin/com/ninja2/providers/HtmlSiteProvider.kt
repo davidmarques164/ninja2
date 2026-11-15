@@ -78,7 +78,7 @@ import java.util.concurrent.TimeUnit
  */
 class HtmlSiteProvider : MainAPI() {
 
-    override var name = "Rede Canais V28"
+    override var name = "Rede Canais V29"
     override var mainUrl = "https://redecanais.by"
     override var lang = "pt-br"
     override val hasMainPage = true
@@ -709,21 +709,28 @@ class HtmlSiteProvider : MainAPI() {
      * WebView e a requisição do vídeo (o player faz um probe com Range antes de tocar)
      * é interceptada.
      */
-    private suspend fun resolveRcPlayer(
+    /**
+     * Também usado pelo LiveSiteProvider (TV): [site] é o domínio do site do player e [label]
+     * o nome do provider nas fontes. Canais ao vivo vêm em HLS (.m3u8).
+     */
+    internal suspend fun resolveRcPlayer(
         playerUrl: String,
         referer: String,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
         emitted: MutableSet<String>,
+        site: String = mainUrl.trimEnd('/'),
+        label: String = name,
     ): Boolean {
-        addRcSubtitle(playerUrl, subtitleCallback)
+        RcDns.install()
+        if (VID_REGEX.containsMatchIn(playerUrl)) addRcSubtitle(playerUrl, subtitleCallback)
 
         log("rc", "WebView em $playerUrl")
 
         // Rede com DNS bloqueado (ex.: 4G da operadora): o WebView usa o DNS do Android e cai na
         // página "Sua operadora bloqueou". Só nesse caso o WebView passa pelo proxy local, que
         // resolve pelo DNS sobre HTTPS. Com DNS ok (Wi-Fi, DNS privado), nada muda.
-        val siteHost = runCatching { URI(mainUrl).host }.getOrNull().orEmpty()
+        val siteHost = runCatching { URI(site).host }.getOrNull().orEmpty()
         val blockReason = if (siteHost.isNotEmpty()) RcDns.dnsBlockReason(siteHost) else ""
         val proxyOn = if (blockReason.isNotEmpty()) {
             log("rc", "DNS do Android bloqueado ($blockReason): ligando proxy do WebView")
@@ -743,25 +750,25 @@ class HtmlSiteProvider : MainAPI() {
             }
         } finally {
             if (proxyOn) RcWebViewProxy.disable()
-        } ?: return debugLink("WebView falhou ao iniciar", callback)
+        } ?: return debugLink("WebView falhou ao iniciar", callback, label)
 
         val intercepted = result.first?.url?.toString()
         log("rc", "interceptado=$intercepted outros=${result.second.size}")
         if (intercepted == null) {
-            return debugLink("timeout: o script de captura não respondeu (página não carregou ou bloqueou o WebView)", callback)
+            return debugLink("timeout: o script de captura não respondeu (página não carregou ou bloqueou o WebView)", callback, label)
         }
 
         // Sentinela do script: ?u=<url do vídeo> ou ?err=<estado do player>
         val captured = if (RC_CAPTURE_HOST in intercepted) {
             val err = CAPTURE_ERR_REGEX.find(intercepted)?.groupValues?.get(1)?.let { URLDecoder.decode(it, "UTF-8") }
-            if (err != null) return debugLink("player sem vídeo: $err", callback)
+            if (err != null) return debugLink("player sem vídeo: $err", callback, label)
             CAPTURE_URL_REGEX.find(intercepted)?.groupValues?.get(1)?.let { URLDecoder.decode(it, "UTF-8") }
-                ?: return debugLink("sentinela sem URL", callback)
+                ?: return debugLink("sentinela sem URL", callback, label)
         } else intercepted
 
         val videoUrl = captured.unwrapRcProxy()
         if (!emitted.add(videoUrl)) return true
-        val site = mainUrl.trimEnd('/')
+        val isHls = HLS_REGEX.containsMatchIn(videoUrl)
         val quality = getQualityFromName(RC_QUALITY_REGEX.find(referer)?.value)
         val playHeaders = mapOf(
             "User-Agent" to USER_AGENT,
@@ -785,7 +792,7 @@ class HtmlSiteProvider : MainAPI() {
                 "Referer" to "$site/",
                 "Accept-Encoding" to "identity",
             )
-            val localUrl = safe("local") { RcLocalProxy.register(v.url, upstreamHeaders) }
+            val localUrl = safe("local") { RcLocalProxy.register(v.url, upstreamHeaders, hls = isHls) }
             if (localUrl != null) {
                 val res = preflight(localUrl, "$site/", emptyMap())
                 allResults.add(0, Variant("local", localUrl) to res)
@@ -798,10 +805,10 @@ class HtmlSiteProvider : MainAPI() {
         for ((v, _) in toEmit) {
             callback(
                 newExtractorLink(
-                    source = name,
-                    name = "$name ${v.label}",
+                    source = label,
+                    name = "$label ${v.label}",
                     url = v.url,
-                    type = ExtractorLinkType.VIDEO,
+                    type = if (isHls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO,
                 ) {
                     this.referer = "$site/"
                     this.quality = quality
@@ -821,7 +828,7 @@ class HtmlSiteProvider : MainAPI() {
             debugLink("teste: " + allResults.joinToString(" | ") { "${it.first.label}=${it.second}" } +
                 " | ip-link=$linkIp" + (if (linkIp6.isNotEmpty()) " ipv6-link=$linkIp6" else "") +
                 " ip-agora=$nowIp" + (if (linkIp != "?" && nowIp != "?" && linkIp != nowIp) " (DIFERENTE)" else "") +
-                " | dns: " + RcDns.report(), callback)
+                " | dns: " + RcDns.report(), callback, label)
         }
         return true
     }
@@ -885,12 +892,12 @@ class HtmlSiteProvider : MainAPI() {
      * Com DEBUG_LINKS, a falha aparece na lista de fontes como "[DEBUG] motivo".
      * O link não toca; é só para ler o motivo. Desligue DEBUG_LINKS depois.
      */
-    private suspend fun debugLink(reason: String, callback: (ExtractorLink) -> Unit): Boolean {
+    private suspend fun debugLink(reason: String, callback: (ExtractorLink) -> Unit, label: String = name): Boolean {
         log("rc", "falha: $reason")
         if (!DEBUG_LINKS) return false
         callback(
             newExtractorLink(
-                source = name,
+                source = label,
                 name = "[DEBUG] ${reason.take(400)} | webproxy=${RcWebViewProxy.status}",
                 url = "https://$RC_CAPTURE_HOST/debug.mp4",
                 type = ExtractorLinkType.VIDEO,
@@ -1148,6 +1155,8 @@ class HtmlSiteProvider : MainAPI() {
         /** Áreas que nunca são episódios: relacionados, listagens, menu, rodapé. */
         const val NOT_EPISODE_AREA = "ul.pm-ul-browse-videos, ul.pm-ul-carousel-videos, nav, header, footer, .breadcrumb, .pm-related-videos, #pm-related"
         val GENERIC_LINK_TEXT_REGEX = Regex("""(?i)^\s*(assistir|ver|play|clique aqui|link|online)?\s*$""")
+        /** Playlist HLS (canais ao vivo), também dentro do parâmetro url= do proxy. */
+        val HLS_REGEX = Regex("""(?i)\.m3u8|%2Em3u8""")
         const val SEARCH_LIMIT = 80
         /** Quantos resultados da busca recebem pôster do TMDB, e o prazo total para isso. */
         const val SEARCH_POSTER_COUNT = 20
@@ -1216,6 +1225,18 @@ class HtmlSiteProvider : MainAPI() {
                     if (ok(c)) s = c;
                     else if (!v.src) { var so = v.querySelector('source'); if (so && ok(so.src)) s = so.src; }
                     if (!s) { v.muted = true; try { var p = v.play(); if (p && p.catch) p.catch(function(){}); } catch(e) {} }
+                  }
+                  // Viblast/MSE (TV ao vivo): o <video> só tem "blob:". A playlist aparece nas
+                  // requisições da página (Resource Timing).
+                  if (!s) {
+                    try {
+                      var es = performance.getEntriesByType('resource');
+                      for (var j = es.length - 1; j >= 0 && !s; j--) {
+                        var nm = es[j].name;
+                        if ((/null-null\.shop\/[^?]*proxy\?/.test(nm) || /\/__RC__\/proxy\?src=/.test(nm))
+                            && /\.m3u8|\.mp4|%2Em3u8|%2Emp4/i.test(nm)) s = nm;
+                      }
+                    } catch(e) {}
                   }
                   if (!s && window.videojs && videojs.getPlayers) {
                     var ps = videojs.getPlayers();
@@ -1377,6 +1398,22 @@ object RcDns : Dns {
         }
         lastResult[hostname] = if (sys.isNullOrEmpty()) "falhou" else "só v6 (descartado)"
         throw firstError ?: UnknownHostException("$hostname: sem endereço IPv4")
+    }
+
+    /**
+     * Host com "_" (inválido para o TLS do Android) -> apelido válido "rcv-<hash>.<domínio>",
+     * coberto pelo certificado curinga, resolvido para os IPs do host real; o host real vai no
+     * header Host. Host válido: URL sem mudança.
+     */
+    fun routeForTls(url: String): Pair<String, Map<String, String>> {
+        val host = url.substringAfter("://").substringBefore('/').substringBefore('?').substringBefore(':')
+        if (host.isEmpty() || runCatching { javax.net.ssl.SNIHostName(host) }.isSuccess) return url to emptyMap()
+        val parts = host.split('.')
+        if (parts.size < 3) return url to emptyMap()
+        val root = parts.takeLast(2).joinToString(".")
+        val fake = "rcv-" + Integer.toHexString(host.hashCode()).trimStart('-') + "." + root
+        alias(fake, host)
+        return url.replaceFirst(host, fake) to mapOf("Host" to host)
     }
 
     /** Para o túnel do WebView: DNS sobre HTTPS primeiro (o DNS do Android pode estar bloqueado). */
@@ -1566,8 +1603,15 @@ class SniSafeSSLSocket(private val d: SSLSocket) : SSLSocket() {
 object RcLocalProxy {
     private const val TAG = "RedeCanais"
     private const val MAX_AGE_MS = 12 * 60 * 60 * 1000L
+    private const val SEGMENT_TTL_MS = 15 * 60 * 1000L
 
-    private class Target(val url: String, val headers: Map<String, String>, val created: Long)
+    private class Target(
+        val url: String,
+        val headers: Map<String, String>,
+        val created: Long,
+        val hls: Boolean = false,
+        val ttl: Long = MAX_AGE_MS,
+    )
 
     private val targets = ConcurrentHashMap<String, Target>()
     @Volatile private var server: ServerSocket? = null
@@ -1585,13 +1629,58 @@ object RcLocalProxy {
     /** Porta do proxy local (sobe o servidor se preciso). */
     fun port(): Int = start()
 
-    fun register(url: String, headers: Map<String, String>): String {
+    fun register(url: String, headers: Map<String, String>, hls: Boolean = false): String {
         val port = start()
         val now = System.currentTimeMillis()
-        targets.entries.removeAll { now - it.value.created > MAX_AGE_MS }
+        targets.entries.removeAll { now - it.value.created > it.value.ttl }
         val id = UUID.randomUUID().toString().replace("-", "").take(20)
-        targets[id] = Target(url, headers, now)
-        return "http://127.0.0.1:$port/v/$id.mp4"
+        targets[id] = Target(url, headers, now, hls)
+        return "http://127.0.0.1:$port/v/$id.${if (hls) "m3u8" else "mp4"}"
+    }
+
+    /** Item de playlist (pedaço .ts ou sub-playlist): id estável pela URL, vida curta (15 min). */
+    private fun registerStable(url: String, headers: Map<String, String>, hls: Boolean): String {
+        val port = start()
+        val id = java.security.MessageDigest.getInstance("SHA-1").digest(url.toByteArray())
+            .joinToString("") { "%02x".format(it) }.take(24)
+        targets.compute(id) { _, old ->
+            if (old != null && System.currentTimeMillis() - old.created < SEGMENT_TTL_MS) old
+            else Target(url, headers, System.currentTimeMillis(), hls, SEGMENT_TTL_MS)
+        }
+        return "http://127.0.0.1:$port/v/$id.${if (hls) "m3u8" else "ts"}"
+    }
+
+    private val URI_ATTR = Regex("""URI="([^"]+)"""")
+
+    /**
+     * Reescreve a playlist HLS: cada pedaço/sub-playlist vira um endereço do proxy local, já com o
+     * desvio de TLS (apelido + Host) para hosts com "_" (ex.: o host dos pedaços .ts da TV).
+     */
+    private fun rewritePlaylist(text: String, t: Target): String {
+        val baseHeaders = t.headers.filterKeys { !it.equals("Host", ignoreCase = true) }
+        val realBase = t.headers.entries.firstOrNull { it.key.equals("Host", true) }?.value
+            ?.let { realHost -> t.url.replaceFirst(t.url.substringAfter("://").substringBefore('/'), realHost) }
+            ?: t.url
+        fun local(ref: String): String {
+            val abs = when {
+                ref.startsWith("http://") || ref.startsWith("https://") -> ref
+                ref.startsWith("//") -> "https:$ref"
+                ref.startsWith("/") -> realBase.substringBefore("://") + "://" +
+                    realBase.substringAfter("://").substringBefore('/') + ref
+                else -> realBase.substringBefore('?').substringBeforeLast('/') + "/" + ref
+            }
+            val (u, extra) = RcDns.routeForTls(abs)
+            val isPl = abs.contains(".m3u8", ignoreCase = true) || abs.contains("%2Em3u8", ignoreCase = true)
+            return registerStable(u, baseHeaders + extra, isPl)
+        }
+        return text.lineSequence().joinToString("\n") { line ->
+            val trimmed = line.trim()
+            when {
+                trimmed.isEmpty() -> line
+                trimmed.startsWith("#") -> URI_ATTR.replace(line) { m -> "URI=\"" + local(m.groupValues[1]) + "\"" }
+                else -> local(trimmed)
+            }
+        }
     }
 
     private fun acceptLoop(ss: ServerSocket) {
@@ -1726,8 +1815,8 @@ object RcLocalProxy {
 
                 val rb = Request.Builder().url(t.url)
                 t.headers.forEach { (k, v) -> rb.header(k, v) }
-                reqHeaders["range"]?.let { rb.header("Range", it) }
-                if (method == "HEAD") rb.head()
+                if (!t.hls) reqHeaders["range"]?.let { rb.header("Range", it) }
+                if (method == "HEAD" && !t.hls) rb.head()
 
                 val resp = try {
                     app.baseClient.newCall(rb.build()).execute()
@@ -1739,6 +1828,16 @@ object RcLocalProxy {
 
                 resp.use { r ->
                     if (r.code >= 400) Log.w(TAG, "[local] upstream HTTP ${r.code} para ${t.url.take(80)}")
+                    val isPlaylist = t.hls || (r.header("Content-Type") ?: "").contains("mpegurl", ignoreCase = true)
+                    if (isPlaylist && r.code in 200..299) {
+                        val body = r.body?.string().orEmpty()
+                        val bytes = rewritePlaylist(body, t).toByteArray()
+                        out.write(("HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\n" +
+                            "Content-Length: ${bytes.size}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n").toByteArray())
+                        if (method != "HEAD") out.write(bytes)
+                        out.flush()
+                        return
+                    }
                     val head = StringBuilder("HTTP/1.1 ${r.code} ${r.message.ifBlank { "OK" }}\r\n")
                     for (h in listOf("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "Last-Modified", "ETag")) {
                         r.header(h)?.let { head.append(h).append(": ").append(it).append("\r\n") }
